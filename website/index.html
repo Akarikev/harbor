@@ -19,54 +19,93 @@
   </head>
   <body>
     <main class="page">
-      <article class="card">
-        <header class="hero">
-          <img class="hero-icon" src="assets/icon.png" width="72" height="72" alt="" />
-          <h1>harbor</h1>
-          <p class="tagline">
-            See every dev server running on localhost from your system tray.
-          </p>
-          <p class="meta">Linux &bull; x86_64 &bull; Free</p>
-        </header>
+      <section class="intro">
+        <img class="app-icon" src="assets/icon.png" width="56" height="56" alt="" />
 
-        <div class="actions">
-          <a id="download-appimage" class="btn btn-primary" href="#" download>
+        <h1>harbor</h1>
+
+        <p class="tagline">
+          See every dev server running on localhost from your system tray.
+        </p>
+
+        <div class="cta-row">
+          <a id="download-appimage" class="btn-download" href="#">
+            <svg class="linux-icon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.88-1.155 3.502-2.333 4.858-1.303 1.504-2.53 2.956-2.53 5.357 0 3.714 2.923 6.035 6.283 6.035 3.564 0 6.275-2.296 6.275-6.035 0-2.401-1.227-3.853-2.53-5.357-1.178-1.356-2.257-2.978-2.333-4.858-.065-1.491 1.056-5.965-3.17-6.298A8.4 8.4 0 0 0 12.504 0zm-.012 1.224c.155 0 .31.006.462.018 3.253.256 2.385 3.806 2.451 5.134.082 2.034 1.266 3.787 2.505 5.232 1.224 1.412 2.384 2.748 2.384 4.952 0 3.037-2.363 4.811-5.8 4.811-3.251 0-5.808-1.774-5.808-4.811 0-2.204 1.16-3.54 2.384-4.952 1.239-1.445 2.423-3.198 2.505-5.232.066-1.328-.802-4.878 2.451-5.134.152-.012.307-.018.462-.018z"/>
+              <circle cx="10.2" cy="8.8" r="1.1"/>
+              <circle cx="14.8" cy="8.8" r="1.1"/>
+              <path d="M10.8 12.2c.6.9 1.8.9 2.4 0" fill="none" stroke="currentColor" stroke-width=".8" stroke-linecap="round"/>
+            </svg>
             Download for Linux
           </a>
-          <div class="secondary-links">
-            <a id="download-deb" class="text-link" href="#" download>.deb package</a>
-            <span class="dot">&middot;</span>
-            <a id="download-rpm" class="text-link" href="#" download>.rpm package</a>
-          </div>
+          <p class="meta">Linux &middot; x86_64 &middot; Free</p>
         </div>
 
-        <figure class="screenshot-wrap">
-          <img
-            class="screenshot"
-            src="assets/screenshot.svg"
-            width="400"
-            height="520"
-            alt="harbor tray popup showing localhost ports"
-          />
-        </figure>
+        <a id="checksum-link" class="verify-link" href="#">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          Verify download
+        </a>
 
-        <section class="install">
-          <h2>Install</h2>
-          <p><strong>AppImage</strong> — download, mark executable, run:</p>
-          <pre><code>chmod +x harbor_*_amd64.AppImage
-./harbor_*_amd64.AppImage</code></pre>
-          <p><strong>.deb</strong> — install with your package manager:</p>
-          <pre><code>sudo dpkg -i harbor_*_amd64.deb</code></pre>
-          <p class="verify">
-            Verify downloads:
-            <a id="checksum-link" href="#" class="text-link">SHA256SUMS</a>
-          </p>
-        </section>
+        <p id="launch-note" class="launch-note" hidden>
+          Downloads go live when v0.1.0 is released.
+        </p>
 
-        <footer class="footer">
-          <a href="https://github.com/Akarikev/harbor" class="text-link">Source on GitHub</a>
-        </footer>
-      </article>
+        <p id="alt-formats" class="alt-formats">
+          Also available as
+          <a id="download-deb" href="#">.deb</a>
+          or
+          <a id="download-rpm" href="#">.rpm</a>
+        </p>
+      </section>
+
+      <figure class="hero-visual">
+        <img
+          class="screenshot"
+          src="assets/screenshot.png"
+          width="1200"
+          height="750"
+          alt="harbor running on a Linux desktop"
+          onerror="this.onerror=null;this.src='assets/screenshot-placeholder.svg';"
+        />
+      </figure>
+
+      <section class="features" aria-labelledby="features-title">
+        <h2 id="features-title">Features</h2>
+        <ul class="features-grid">
+          <li>
+            <span class="feature-title">Tray port list</span>
+            <span class="feature-desc">All listening localhost servers in one popup from your system tray.</span>
+          </li>
+          <li>
+            <span class="feature-title">Process stats</span>
+            <span class="feature-desc">CPU, memory, uptime, and energy impact at a glance.</span>
+          </li>
+          <li>
+            <span class="feature-title">Open in browser</span>
+            <span class="feature-desc">Jump to any localhost URL without hunting for the port.</span>
+          </li>
+          <li>
+            <span class="feature-title">Kill with confirmation</span>
+            <span class="feature-desc">Stop dev servers safely — terminate or force-kill when you need to.</span>
+          </li>
+          <li>
+            <span class="feature-title">System protection</span>
+            <span class="feature-desc">System services stay locked — no accidental kills on ulauncher or shell apps.</span>
+          </li>
+          <li>
+            <span class="feature-title">Light &amp; dark themes</span>
+            <span class="feature-desc">Follow system appearance or pick light, dark, or auto.</span>
+          </li>
+        </ul>
+      </section>
     </main>
 
     <script src="main.js"></script>

@@ -7,6 +7,7 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "build:linux": "tauri build",
+    "website:preview": "bunx --bun serve website -p 4173",
     "tauri": "tauri"
   },
   "devDependencies": {
