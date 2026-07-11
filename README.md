@@ -14,7 +14,7 @@ Pre-built binaries are published on [GitHub Releases](https://github.com/Akarike
 | **.deb** | Ubuntu, Debian, Pop!_OS, Mint |
 | **.rpm** | Fedora, RHEL, openSUSE |
 
-Visit the [landing page](https://harbor-website.vercel.app) (Vercel, root `website/`) for install instructions and checksums.
+Deploy the static landing page from `website/` on Vercel (see [LAUNCH.md](LAUNCH.md)).
 
 ### AppImage quick start
 

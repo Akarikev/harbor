@@ -7,6 +7,15 @@
 3. Deploy Vercel site (root directory: `website/`) — connect to `Akarikev/harbor`
 4. Confirm screenshot and copy on landing page
 
+### Vercel setup
+
+1. Import `Akarikev/harbor` in the [Vercel dashboard](https://vercel.com/new)
+2. Set **Root Directory** to `website`
+3. Deploy — no build command needed (static HTML/CSS/JS)
+4. After launch, update `README.md` with the live Vercel URL
+
+Download buttons on the site fetch release assets from the GitHub API once the repo is **public** and `v0.1.0` is tagged.
+
 ## Release
 
 ```bash

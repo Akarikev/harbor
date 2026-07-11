@@ -65,8 +65,11 @@ jobs:
             | xargs -0 sha256sum > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Upload SHA256SUMS
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: src-tauri/target/release/bundle/SHA256SUMS
+      - name: Upload SHA256SUMS to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            src-tauri/target/release/bundle/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --clobber

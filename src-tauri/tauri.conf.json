@@ -36,7 +36,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "category": "Development",
+    "category": "DeveloperTool",
     "shortDescription": "See every dev server on localhost from your tray",
     "longDescription": "harbor is a lightweight Linux tray utility that lists listening TCP ports, shows process metadata, and lets you open, copy, or kill dev servers while protecting system services.",
     "icon": [
