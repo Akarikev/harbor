@@ -92,6 +92,10 @@ Release artifacts appear in `src-tauri/target/release/bundle/`.
 
 See [LAUNCH.md](LAUNCH.md) for the v0.1.0 release checklist.
 
+## Acknowledgements
+
+harbor was inspired by [Ports](https://ports-app.com) for macOS, built by [Alex Tapper](https://x.com/ABTapper). See [the original tweet](https://x.com/ABTapper/status/2068587240670843083) that sparked the idea. harbor is an independent Linux project — not affiliated with Ports or Cursor.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

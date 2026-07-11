@@ -4,6 +4,8 @@ All notable changes to harbor are documented in this file.
 
 ## [0.1.0] - 2026-07-11
 
+Initial release. Inspired by [Ports](https://ports-app.com) for macOS by Alex Tapper.
+
 ### Added
 
 - System tray app for listing localhost TCP listeners

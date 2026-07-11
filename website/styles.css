@@ -234,6 +234,23 @@ h1 {
   color: var(--text-secondary);
 }
 
+.credits {
+  margin-top: 48px;
+  font-size: 0.8125rem;
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
+
+.credits a {
+  color: var(--text-secondary);
+  text-decoration: none;
+}
+
+.credits a:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 @media (max-width: 640px) {
   .page {
     padding: 48px 20px 32px;
