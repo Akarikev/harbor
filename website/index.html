@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>harbor — localhost port monitor for Linux</title>
+    <meta
+      name="description"
+      content="See every dev server running on localhost from your system tray. Free for Linux x86_64."
+    />
+    <link rel="icon" href="assets/icon.png" type="image/png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <article class="card">
+        <header class="hero">
+          <img class="hero-icon" src="assets/icon.png" width="72" height="72" alt="" />
+          <h1>harbor</h1>
+          <p class="tagline">
+            See every dev server running on localhost from your system tray.
+          </p>
+          <p class="meta">Linux &bull; x86_64 &bull; Free</p>
+        </header>
+
+        <div class="actions">
+          <a id="download-appimage" class="btn btn-primary" href="#" download>
+            Download for Linux
+          </a>
+          <div class="secondary-links">
+            <a id="download-deb" class="text-link" href="#" download>.deb package</a>
+            <span class="dot">&middot;</span>
+            <a id="download-rpm" class="text-link" href="#" download>.rpm package</a>
+          </div>
+        </div>
+
+        <figure class="screenshot-wrap">
+          <img
+            class="screenshot"
+            src="assets/screenshot.svg"
+            width="400"
+            height="520"
+            alt="harbor tray popup showing localhost ports"
+          />
+        </figure>
+
+        <section class="install">
+          <h2>Install</h2>
+          <p><strong>AppImage</strong> — download, mark executable, run:</p>
+          <pre><code>chmod +x harbor_*_amd64.AppImage
+./harbor_*_amd64.AppImage</code></pre>
+          <p><strong>.deb</strong> — install with your package manager:</p>
+          <pre><code>sudo dpkg -i harbor_*_amd64.deb</code></pre>
+          <p class="verify">
+            Verify downloads:
+            <a id="checksum-link" href="#" class="text-link">SHA256SUMS</a>
+          </p>
+        </section>
+
+        <footer class="footer">
+          <a href="https://github.com/Akarikev/harbor" class="text-link">Source on GitHub</a>
+        </footer>
+      </article>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>

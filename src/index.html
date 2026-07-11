@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en" data-theme="system">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Harbor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="header" data-tauri-drag-region>
+        <h1 id="app-title" data-tauri-drag-region>harbor</h1>
+        <div id="header-actions">
+          <label class="toggle-container" title="Show all ports including system services">
+            <span class="toggle-label">Show all</span>
+            <input type="checkbox" id="show-all-toggle" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </header>
+
+      <main id="port-list-container">
+        <div id="port-list"></div>
+
+        <div id="empty-state" class="hidden">
+          <p id="empty-title">No servers running</p>
+        </div>
+
+        <div id="loading-state">
+          <div class="spinner"></div>
+        </div>
+      </main>
+
+      <footer id="footer">
+        <div class="footer-left">
+          <button id="settings-btn" title="Settings" aria-label="Settings">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+            <span>Settings</span>
+          </button>
+        </div>
+        <div class="footer-right">
+          <button id="quit-btn" title="Quit harbor">Quit</button>
+        </div>
+      </footer>
+
+      <section id="settings-panel" class="hidden" aria-hidden="true">
+        <div id="settings-backdrop"></div>
+        <div id="settings-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <div id="settings-header">
+            <div>
+              <p id="settings-kicker">Preferences</p>
+              <h2 id="settings-title">Settings</h2>
+            </div>
+            <button id="settings-close" type="button" aria-label="Close settings">✕</button>
+          </div>
+
+          <div class="settings-body">
+            <div class="settings-section">
+              <div class="settings-section-header">
+                <h3>Appearance</h3>
+                <p>Choose how harbor looks.</p>
+              </div>
+
+              <div class="settings-row">
+                <span class="settings-row-label">Theme</span>
+                <div
+                  class="custom-select"
+                  id="theme-select"
+                  data-value="system"
+                  role="listbox"
+                  aria-label="Theme"
+                >
+                  <button type="button" class="custom-select-trigger" aria-haspopup="listbox">
+                    <span class="custom-select-value">Follow system</span>
+                    <svg class="custom-select-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                  </button>
+                  <div class="custom-select-menu hidden" role="presentation">
+                    <button type="button" class="custom-select-option" role="option" data-value="light">Light</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="system">Follow system</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="dark">Dark</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="settings-section">
+              <div class="settings-section-header">
+                <h3>Scanning</h3>
+                <p>Control how often harbor scans.</p>
+              </div>
+
+              <div class="settings-row">
+                <span class="settings-row-label">Auto refresh</span>
+                <div
+                  class="custom-select"
+                  id="refresh-select"
+                  data-value="5000"
+                  role="listbox"
+                  aria-label="Auto refresh"
+                >
+                  <button type="button" class="custom-select-trigger" aria-haspopup="listbox">
+                    <span class="custom-select-value">Every 5 seconds</span>
+                    <svg class="custom-select-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                  </button>
+                  <div class="custom-select-menu hidden" role="presentation">
+                    <button type="button" class="custom-select-option" role="option" data-value="2000">Every 2 seconds</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="5000">Every 5 seconds</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="10000">Every 10 seconds</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="30000">Every 30 seconds</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="0">Off</button>
+                  </div>
+                </div>
+              </div>
+
+              <label class="settings-row settings-toggle-row" for="show-all-toggle-settings">
+                <span class="settings-row-label">
+                  <strong>Show all ports</strong>
+                  <em>Include system services</em>
+                </span>
+                <span class="toggle-container">
+                  <input type="checkbox" id="show-all-toggle-settings" />
+                  <span class="toggle-slider"></span>
+                </span>
+              </label>
+            </div>
+
+            <div class="settings-section">
+              <div class="settings-section-header">
+                <h3>Killing</h3>
+                <p>How harbor stops processes.</p>
+              </div>
+
+              <label class="settings-row settings-toggle-row" for="confirm-kill-toggle">
+                <span class="settings-row-label">
+                  <strong>Confirm before kill</strong>
+                  <em>Ask before sending a signal</em>
+                </span>
+                <span class="toggle-container">
+                  <input type="checkbox" id="confirm-kill-toggle" checked />
+                  <span class="toggle-slider"></span>
+                </span>
+              </label>
+
+              <div class="settings-row">
+                <span class="settings-row-label">Default kill action</span>
+                <div
+                  class="custom-select"
+                  id="kill-action-select"
+                  data-value="soft"
+                  role="listbox"
+                  aria-label="Default kill action"
+                >
+                  <button type="button" class="custom-select-trigger" aria-haspopup="listbox">
+                    <span class="custom-select-value">Soft (SIGTERM)</span>
+                    <svg class="custom-select-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                  </button>
+                  <div class="custom-select-menu hidden" role="presentation">
+                    <button type="button" class="custom-select-option" role="option" data-value="soft">Soft (SIGTERM)</button>
+                    <button type="button" class="custom-select-option" role="option" data-value="force">Force (SIGKILL)</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="confirm-panel" class="hidden" aria-hidden="true">
+        <div id="confirm-backdrop"></div>
+        <div id="confirm-card" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+          <h2 id="confirm-title">Confirm action</h2>
+          <p id="confirm-message"></p>
+          <div id="confirm-actions">
+            <button id="confirm-cancel" type="button">Cancel</button>
+            <button id="confirm-accept" type="button">Confirm</button>
+          </div>
+        </div>
+      </section>
+
+      <div id="toast" class="hidden" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

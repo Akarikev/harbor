@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=harbor
+Comment=Localhost port monitor
+Exec=harbor
+Icon=harbor
+Terminal=false
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

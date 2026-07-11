@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <!-- Rounded app tile -->
+  <rect width="512" height="512" rx="112" fill="#1C1C1E"/>
+
+  <!-- Soft water band -->
+  <path d="M64 360c48-28 96-28 144 0s96 28 144 0 96-28 144 0v88H64v-88z" fill="#2A3A55"/>
+  <path d="M64 384c48-22 96-22 144 0s96 22 144 0 96-22 144 0v28c-48-18-96-18-144 0s-96 18-144 0-96-18-144 0v-28z" fill="#4A80FF" fill-opacity="0.35"/>
+
+  <!-- Pier / dock base -->
+  <rect x="168" y="300" width="176" height="28" rx="8" fill="#E8EEF8"/>
+  <rect x="188" y="328" width="18" height="52" rx="4" fill="#C5D0E4"/>
+  <rect x="306" y="328" width="18" height="52" rx="4" fill="#C5D0E4"/>
+
+  <!-- Lighthouse tower -->
+  <path d="M228 300V168c0-8 6-14 14-14h28c8 0 14 6 14 14v132H228z" fill="#F4F7FC"/>
+  <rect x="236" y="190" width="14" height="18" rx="3" fill="#1C1C1E"/>
+  <rect x="262" y="190" width="14" height="18" rx="3" fill="#1C1C1E"/>
+  <rect x="236" y="230" width="14" height="18" rx="3" fill="#1C1C1E"/>
+  <rect x="262" y="230" width="14" height="18" rx="3" fill="#1C1C1E"/>
+
+  <!-- Lantern house -->
+  <rect x="220" y="128" width="72" height="40" rx="8" fill="#E8EEF8"/>
+  <rect x="232" y="136" width="48" height="24" rx="4" fill="#4A80FF"/>
+
+  <!-- Roof -->
+  <path d="M210 132l46-36 46 36H210z" fill="#F4F7FC"/>
+  <circle cx="256" cy="92" r="10" fill="#4A80FF"/>
+
+  <!-- Light beams -->
+  <path d="M266 96l110-34c6-2 12 4 9 10l-28 58c-2 4-7 5-11 3L266 108V96z" fill="#4A80FF" fill-opacity="0.55"/>
+  <path d="M246 96L136 62c-6-2-12 4-9 10l28 58c2 4 7 5 11 3L246 108V96z" fill="#4A80FF" fill-opacity="0.35"/>
+</svg>
