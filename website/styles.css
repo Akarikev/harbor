@@ -234,11 +234,22 @@ h1 {
   color: var(--text-secondary);
 }
 
-.credits {
+.site-footer {
   margin-top: 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.credits {
   font-size: 0.8125rem;
   color: var(--text-tertiary);
   line-height: 1.5;
+}
+
+.credits-muted {
+  color: var(--text-tertiary);
+  opacity: 0.85;
 }
 
 .credits a {
