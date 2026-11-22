@@ -2,7 +2,7 @@
 Type=Application
 Name=harbor
 Comment=Localhost port monitor
-Exec=harbor
+Exec=harbor --hidden
 Icon=harbor
 Terminal=false
 Hidden=false

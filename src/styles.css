@@ -113,19 +113,15 @@ button {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 16px 8px;
   flex-shrink: 0;
-  -webkit-app-region: drag;
-  cursor: grab;
 }
 
 #app-title {
   font-size: 15px; font-weight: 700;
   color: var(--text-primary);
-  -webkit-app-region: drag;
 }
 
 #header-actions {
   display: flex; align-items: center;
-  -webkit-app-region: no-drag;
   min-height: 18px;
 }
 
@@ -347,7 +343,6 @@ button {
   border-radius: 7px;
   cursor: pointer;
   transition: background var(--transition), color var(--transition);
-  -webkit-app-region: no-drag;
 }
 .hover-action svg {
   width: 14px;
@@ -387,7 +382,6 @@ button {
   border-radius: 999px;
   cursor: pointer;
   transition: transform 0.2s, color 0.2s, background 0.2s;
-  -webkit-app-region: no-drag;
   margin-left: auto;
 }
 .port-row.expanded .expand-btn {
@@ -471,7 +465,6 @@ button {
   color: var(--text-secondary);
   cursor: pointer;
   transition: 0.2s ease;
-  -webkit-app-region: no-drag;
   font-family: var(--font-sans);
   font-size: 12px;
   line-height: 1;
@@ -523,7 +516,7 @@ button {
   background: none; border: none; color: var(--text-secondary);
   font-size: 12px; font-weight: 500; cursor: pointer;
   font-family: var(--font-sans);
-  -webkit-app-region: no-drag; transition: color 0.2s;
+  transition: color 0.2s;
 }
 .footer-left button:hover, .footer-right button:hover {
   color: var(--text-primary);

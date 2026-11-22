@@ -1,13 +1,12 @@
+use ksni::TrayMethods;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
-    tray::TrayIconBuilder,
-    AppHandle, Manager,
-};
+use tauri::{AppHandle, Manager};
+
+mod popup;
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
 
@@ -88,10 +87,8 @@ fn package_name_from_script_path(path: &str) -> Option<String> {
 
     if let Some(idx) = parts.iter().position(|p| *p == "node_modules") {
         if let Some(pkg) = parts.get(idx + 1) {
-            if *pkg == ".bin" {
-                if let Some(bin) = parts.get(idx + 2) {
-                    return Some((*bin).to_string());
-                }
+            if *pkg == ".bin" || pkg.starts_with('@') {
+                return parts.get(idx + 2).map(|name| (*name).to_string());
             } else if !pkg.starts_with('.') {
                 return Some((*pkg).to_string());
             }
@@ -842,36 +839,149 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+struct HarborTray {
+    app: AppHandle,
+    icon: ksni::Icon,
+}
+
+impl ksni::Tray for HarborTray {
+    const MENU_ON_ACTIVATE: bool = false;
+
+    fn id(&self) -> String {
+        "harbor".into()
+    }
+
+    fn title(&self) -> String {
+        "harbor".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![self.icon.clone()]
+    }
+
+    fn activate(&mut self, x: i32, y: i32) {
+        append_log(&format!(">>> tray activate x={x} y={y}"));
+        popup::request(&self.app, Some((x, y)), ksni::current_xdg_activation_token());
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+
+        vec![StandardItem {
+            label: "Open harbor".into(),
+            activate: Box::new(|tray: &mut Self| {
+                popup::request(&tray.app, None, ksni::current_xdg_activation_token());
+            }),
+            ..Default::default()
+        }
+        .into()]
+    }
+}
+
+async fn start_tray(app: AppHandle) -> Result<(), String> {
+    let image = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+        .map_err(|err| err.to_string())?;
+    let icon = ksni::Icon {
+        width: image.width() as i32,
+        height: image.height() as i32,
+        data: image
+            .rgba()
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]])
+            .collect(),
+    };
+    let tray = HarborTray {
+        app: app.clone(),
+        icon,
+    };
+    let handle = tray
+        .assume_sni_available(true)
+        .spawn()
+        .await
+        .map_err(|err| err.to_string())?;
+    app.manage(handle);
+    append_log(">>> tray service started via ksni");
+    Ok(())
+}
+
 // ─── App Entry ────────────────────────────────────────────────────────────────
+
+const ACTIVATION_TOKEN_ARG: &str = "--activation-token=";
+
+// shortcut: mirrors the plugin's private D-Bus API; re-check when bumping the pinned version.
+fn forward_activation_token(identifier: &str, token: &str) -> bool {
+    use gtk::{gio, glib::variant::ToVariant};
+
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return false;
+    };
+    let name = format!("{identifier}.SingleInstance");
+    let path = format!("/{}", name.replace('.', "/").replace('-', "_"));
+    let args: Vec<_> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .chain(std::iter::once(format!("{ACTIVATION_TOKEN_ARG}{token}")))
+        .collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    // The Linux single-instance plugin forwards argv but does not forward the launch environment.
+    bus.call_sync(
+        Some(&name),
+        &path,
+        "org.SingleInstance.DBus",
+        "ExecuteCallback",
+        Some(&(args, cwd.to_string_lossy().as_ref()).to_variant()),
+        None,
+        gio::DBusCallFlags::NO_AUTO_START,
+        1000,
+        gio::Cancellable::NONE,
+    )
+    .is_ok()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    let startup_token = std::env::var("XDG_ACTIVATION_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    if startup_token
+        .as_deref()
+        .is_some_and(|token| forward_activation_token(&context.config().identifier, token))
+    {
+        return;
+    }
+
+    let placement_mode = popup::choose_placement_mode();
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let quit = MenuItemBuilder::new("Quit harbor").id("quit").build(app)?;
-            let show = MenuItemBuilder::new("Show").id("show").build(app)?;
-            let menu = MenuBuilder::new(app)
-                .item(&show)
-                .separator()
-                .item(&quit)
-                .build()?;
-
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "quit" => app.exit(0),
-                    "show" => toggle_window(app),
-                    _ => {}
-                })
-                .build(app)?;
-
-            // Start hidden until opened from the tray menu.
-            if let Some(win) = app.get_webview_window("main") {
-                win.hide().ok();
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if !args.iter().skip(1).any(|arg| arg == "--hidden") {
+                let token = args
+                    .iter()
+                    .skip(1)
+                    .rev()
+                    .filter_map(|arg| arg.strip_prefix(ACTIVATION_TOKEN_ARG))
+                    .find(|token| !token.is_empty())
+                    .map(str::to_owned);
+                popup::request(app, None, token);
             }
+        }))
+        .plugin(tauri_plugin_opener::init())
+        .on_window_event(popup::on_window_event)
+        .setup(move |app| {
+            popup::setup(app.handle(), placement_mode)?;
 
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = start_tray(handle).await {
+                    let message = format!(">>> tray startup failed: {err}");
+                    append_log(&message);
+                    eprintln!("{message}");
+                }
+            });
+
+            if !std::env::args_os().skip(1).any(|arg| arg == "--hidden") {
+                popup::request(app.handle(), None, startup_token);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -880,21 +990,8 @@ pub fn run() {
             open_in_browser,
             quit_app
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running harbor");
-}
-
-// ─── Window helpers ───────────────────────────────────────────────────────────
-
-fn toggle_window(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) {
-            win.hide().ok();
-        } else {
-            win.show().ok();
-            win.set_focus().ok();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -903,6 +1000,18 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn resolves_scoped_unscoped_and_bin_package_names() {
+        for (path, name) in [
+            ("/project/node_modules/@openai/codex/vendor/bin/codex", "codex"),
+            ("/project/node_modules/openclaw/dist/index.js", "openclaw"),
+            ("/project/node_modules/.bin/tauri", "tauri"),
+        ] {
+            assert_eq!(package_name_from_script_path(path).as_deref(), Some(name));
+        }
+        assert_eq!(package_name_from_script_path("/project/node_modules/@openai"), None);
+    }
 
     #[test]
     fn parses_proc_stat_after_the_process_name() {

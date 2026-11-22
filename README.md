@@ -25,24 +25,15 @@ chmod +x harbor_*_amd64.AppImage
 
 ### Autostart
 
-After installing, enable autostart so harbor runs on login:
+The Debian and RPM packages start harbor automatically at login. To disable it, use your desktop's Startup Applications settings or copy `/etc/xdg/autostart/harbor.desktop` to `~/.config/autostart/` and set `Hidden=true` in the copy.
 
-```bash
-mkdir -p ~/.config/autostart
-cp /usr/share/applications/harbor.desktop ~/.config/autostart/ 2>/dev/null || true
-```
-
-Or create `~/.config/autostart/harbor.desktop`:
+For AppImage autostart, create `~/.config/autostart/harbor.desktop` with the absolute path to your AppImage:
 
 ```ini
 [Desktop Entry]
 Type=Application
 Name=harbor
-Comment=Localhost port monitor
-Exec=harbor
-Hidden=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
+Exec=/path/to/harbor.AppImage --hidden
 ```
 
 ## Features

@@ -40,7 +40,6 @@ function getCurrentAppWindow() {
 // ─── State ───────────────────────────────────────────────────────────────────
 let ports = [];
 let popupFocused = false;
-let hideTimeout = null;
 let refreshInterval = null;
 let scanInFlight = false;
 let latestScanRequest = 0;
@@ -56,7 +55,6 @@ let toastTimer = null;
 const portList = document.getElementById('port-list');
 const emptyState = document.getElementById('empty-state');
 const loadingState = document.getElementById('loading-state');
-const header = document.getElementById('header');
 const quitBtn = document.getElementById('quit-btn');
 const settingsBtn = document.getElementById('settings-btn');
 const showAllToggle = document.getElementById('show-all-toggle');
@@ -109,35 +107,7 @@ function energyIconSvg() {
 }
 
 function getDisplayName(entry) {
-  const processName = String(entry.process_name || '').trim();
-  const cmdline = String(entry.cmdline || '');
-  const cmdlineLower = cmdline.toLowerCase();
-  const commandName = getCommandName(entry.cmdline, processName);
-  const generic = /^(MainThread|ThreadPool|Chrome_|.*Thread)$/i;
-
-  if (cmdlineLower.includes('next')) return 'next';
-  if (cmdlineLower.includes('vite')) return 'vite';
-  if (cmdlineLower.includes('nuxt')) return 'nuxt';
-
-  // Prefer package names from node_modules paths: .../node_modules/.bin/tauri
-  const nm = cmdline.match(/node_modules\/(?:\.bin\/)?([^/\s]+)/);
-  if (nm?.[1] && !generic.test(nm[1])) {
-    return nm[1];
-  }
-
-  // .../openclaw/dist/index.js → openclaw
-  const dist = cmdline.match(/\/([^/\s]+)\/(?:dist|build|lib|out|\.next)\/[^/\s]+/);
-  if (dist?.[1] && !generic.test(dist[1]) && dist[1] !== 'node_modules') {
-    return dist[1];
-  }
-
-  if (processName && !generic.test(processName)) {
-    return processName;
-  }
-  if (commandName && !generic.test(commandName)) {
-    return commandName;
-  }
-  return processName || commandName || 'unknown';
+  return entry.process_name?.trim() || getCommandName(entry.cmdline);
 }
 
 function getPathContext(cmdline, pid) {
@@ -494,12 +464,15 @@ function render() {
       const energy = getEnergyImpact(entry.cpu_percent);
       existing.dataset.pid = entry.pid;
 
-      const cpuVal = existing.querySelector('.cpu-val');
-      const memVal = existing.querySelector('.mem-val');
-      const uptimeVal = existing.querySelector('.uptime-val');
-      if (cpuVal) cpuVal.textContent = formatCpu(entry.cpu_percent);
-      if (memVal) memVal.textContent = formatMem(entry.mem_mb);
-      if (uptimeVal) uptimeVal.textContent = formatUptime(entry.uptime_seconds);
+      for (const value of existing.querySelectorAll('.cpu-val')) {
+        value.textContent = formatCpu(entry.cpu_percent);
+      }
+      for (const value of existing.querySelectorAll('.mem-val')) {
+        value.textContent = formatMem(entry.mem_mb);
+      }
+      for (const value of existing.querySelectorAll('.uptime-val')) {
+        value.textContent = formatUptime(entry.uptime_seconds);
+      }
 
       const energyEl = existing.querySelector('.energy-val');
       const energyPill = existing.querySelector('.status-pill');
@@ -508,6 +481,11 @@ function render() {
       }
       if (energyPill) {
         energyPill.className = `status-pill ${energy.class}`;
+      }
+      const detailEnergy = existing.querySelector('.detail-energy');
+      if (detailEnergy) {
+        detailEnergy.className = `detail-value detail-energy ${energy.class}`;
+        detailEnergy.textContent = `${energy.label} impact`;
       }
 
       const nameEl = existing.querySelector('.process-name');
@@ -613,19 +591,19 @@ function createRow(entry) {
         </div>
         <div class="detail-item">
           <span class="detail-label">Uptime</span>
-          <span class="detail-value">${formatUptime(entry.uptime_seconds)}</span>
+          <span class="detail-value uptime-val">${formatUptime(entry.uptime_seconds)}</span>
         </div>
         <div class="detail-item">
           <span class="detail-label">CPU</span>
-          <span class="detail-value">${formatCpu(entry.cpu_percent)}</span>
+          <span class="detail-value cpu-val">${formatCpu(entry.cpu_percent)}</span>
         </div>
         <div class="detail-item">
           <span class="detail-label">Memory</span>
-          <span class="detail-value">${formatMem(entry.mem_mb)}</span>
+          <span class="detail-value mem-val">${formatMem(entry.mem_mb)}</span>
         </div>
         <div class="detail-item">
           <span class="detail-label">Energy</span>
-          <span class="detail-value ${energy.class}">${energy.label} impact</span>
+          <span class="detail-value detail-energy ${energy.class}">${energy.label} impact</span>
         </div>
       </div>
       <div class="detail-actions">
@@ -795,18 +773,6 @@ initCustomSelect(themeSelect, THEME_LABELS, (value) => applyTheme(value));
 initCustomSelect(refreshSelect, REFRESH_LABELS, (value) => applyRefreshInterval(value));
 initCustomSelect(killActionSelect, KILL_ACTION_LABELS, (value) => applyKillAction(value));
 
-header.addEventListener('pointerdown', async (event) => {
-  if (event.button !== 0) return;
-  if (event.target.closest('button, input, label, a, textarea, select')) return;
-
-  try {
-    const appWindow = getCurrentAppWindow();
-    await appWindow?.startDragging?.();
-  } catch (err) {
-    console.error('window drag failed:', err);
-  }
-});
-
 quitBtn.addEventListener('click', async () => {
   try {
     await invokeCommand('quit_app');
@@ -815,32 +781,35 @@ quitBtn.addEventListener('click', async () => {
   }
 });
 
+async function hidePopup() {
+  try {
+    await getCurrentAppWindow()?.hide();
+  } catch (err) {
+    console.error('window hide failed:', err);
+  }
+}
+
 function handlePopupFocus(focused) {
   if (popupFocused === focused) return;
   popupFocused = focused;
   restartRefreshInterval(getSavedRefreshInterval());
 
   if (focused) {
-    clearTimeout(hideTimeout);
-    hideTimeout = null;
     refresh({ supersede: true });
     return;
   }
 
   ++latestScanRequest;
-  hideTimeout = setTimeout(async () => {
-    try {
-      await getCurrentAppWindow()?.hide();
-    } catch (_) {}
-  }, 200);
 }
 
 window.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') {
-    closeAllCustomSelects();
-    closeSettings();
-    closeConfirm(false);
+  if (event.key !== 'Escape') return;
+  if (settingsPanel.classList.contains('hidden') && confirmPanel.classList.contains('hidden')) {
+    hidePopup();
+    return;
   }
+  closeSettings();
+  closeConfirm(false);
 });
 
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {

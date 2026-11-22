@@ -7,5 +7,5 @@ Exec=harbor
 Icon=harbor
 Terminal=false
 Categories=Development;Utility;
-StartupNotify=false
+StartupNotify=true
 Keywords=ports;localhost;dev;server;tray;
