@@ -11,6 +11,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "harbor",
         "width": 400,
         "height": 520,

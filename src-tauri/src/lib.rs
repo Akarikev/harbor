@@ -690,7 +690,26 @@ fn signal_processes(killable: Vec<u32>, signal: i32) -> Result<(), String> {
 
 #[tauri::command]
 fn open_in_browser(url: String) -> Result<(), String> {
-    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+    use gtk::{gdk, gio};
+
+    if !is_local_browser_url(&url) {
+        return Err("Expected an HTTP loopback URL with a port".into());
+    }
+
+    let context = gdk::Display::default().and_then(|display| display.app_launch_context());
+    if let Some(context) = &context {
+        context.set_timestamp(gtk::current_event_time());
+    }
+    gio::AppInfo::launch_default_for_uri(&url, context.as_ref()).map_err(|err| err.to_string())
+}
+
+fn is_local_browser_url(url: &str) -> bool {
+    url.strip_prefix("http://localhost:")
+        .or_else(|| url.strip_prefix("http://127.0.0.1:"))
+        .is_some_and(|port| {
+            port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        })
 }
 
 #[tauri::command]
@@ -824,10 +843,9 @@ pub fn run() {
                 popup::request(app, None, token);
             }
         }))
-        .plugin(tauri_plugin_opener::init())
         .on_window_event(popup::on_window_event)
         .setup(move |app| {
-            popup::setup(app.handle(), placement_mode)?;
+            popup::setup(app.handle(), placement_mode);
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -849,8 +867,17 @@ pub fn run() {
             open_in_browser,
             quit_app
         ])
-        .run(context)
-        .expect("error while running harbor");
+        .build(context)
+        .expect("error while building harbor")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } if label == "main" => popup::on_destroyed(app),
+            _ => (),
+        });
 }
 
 #[cfg(test)]
@@ -859,6 +886,26 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn browser_urls_require_http_loopback_and_a_valid_port() {
+        for url in ["http://localhost:3000", "http://127.0.0.1:65535"] {
+            assert!(is_local_browser_url(url), "{url}");
+        }
+        for url in [
+            "http://localhost",
+            "http://localhost:0",
+            "http://localhost:65536",
+            "http://localhost:+3000",
+            "http://localhost:3000/path",
+            "http://localhost:3000@evil.example",
+            "http://localhost.evil.example:3000",
+            "https://127.0.0.1:3000",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_local_browser_url(url), "{url}");
+        }
+    }
 
     #[test]
     fn parses_only_listening_tcp_sockets_from_both_address_families() {
