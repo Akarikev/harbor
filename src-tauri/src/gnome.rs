@@ -18,9 +18,10 @@ const BUS_NAME: &str = "io.harbor.Harbor";
 const OBJECT_PATH: &str = "/io/harbor/Harbor";
 /// Owned by the extension while it is enabled (see gnome-extension/extension.js).
 const PRESENCE_NAME: &str = "io.harbor.GnomeIntegration";
-const FILES: [(&str, &str); 3] = [
+const FILES: [(&str, &str); 4] = [
     ("metadata.json", include_str!("../gnome-extension/metadata.json")),
     ("extension.js", include_str!("../gnome-extension/extension.js")),
+    ("blur.js", include_str!("../gnome-extension/blur.js")),
     ("harbor-symbolic.svg", include_str!("../gnome-extension/harbor-symbolic.svg")),
 ];
 
@@ -45,6 +46,27 @@ impl HarborService {
     fn hide(&self) {
         popup::request_hide(&self.app);
     }
+
+    async fn set_blur(
+        &self,
+        active: bool,
+        palette: Vec<u8>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        let owner = fdo::DBusProxy::new(connection)
+            .await?
+            .get_name_owner(PRESENCE_NAME.try_into().expect("valid bus name"))
+            .await?;
+        if header.sender() != Some(&owner) {
+            return Err(fdo::Error::AccessDenied("Only the harbor extension can set blur".into()));
+        }
+        let palette = parse_palette(active, &palette)
+            .map_err(|message| fdo::Error::InvalidArgs(message.into()))?;
+        append_log(&format!(">>> GNOME blur active={active}"));
+        popup::set_blur_palette(&self.app, palette);
+        Ok(())
+    }
 }
 
 /// Serve the D-Bus API and keep the tray icon off while the extension is active.
@@ -59,8 +81,12 @@ pub(crate) async fn run(app: AppHandle) {
 async fn serve(app: AppHandle) -> zbus::Result<()> {
     if is_gnome() && installed() {
         // Keep an installed extension in step with this harbor version.
-        if let Err(err) = write_files() {
-            append_log(&format!(">>> gnome extension refresh failed: {err}"));
+        // Never replace a newer installed extension with this binary's older copy
+        // (e.g. an older packaged harbor autostarting after a dev build installed it).
+        if !embedded_is_older() {
+            if let Err(err) = write_files() {
+                append_log(&format!(">>> gnome extension refresh failed: {err}"));
+            }
         }
     }
     let connection = connection::Builder::session()?
@@ -83,12 +109,35 @@ async fn serve(app: AppHandle) -> zbus::Result<()> {
     Ok(())
 }
 
+/// Decode SetBlur's palette: panel RGBA, bar RGBA, optional theme text RGBA, optional radius.
+fn parse_palette(active: bool, palette: &[u8]) -> Result<Option<popup::BlurPalette>, &'static str> {
+    Ok(match (active, palette) {
+        (true, [r, g, b, a, br, bg, bb, ba, rest @ ..]) if rest.len() <= 5 => {
+            let (text, radius) = match rest {
+                [tr, tg, tb, ta, radius @ ..] => (Some([*tr, *tg, *tb, *ta]), radius),
+                radius => (None, radius),
+            };
+            Some(popup::BlurPalette {
+                panel: [*r, *g, *b, *a],
+                bar: [*br, *bg, *bb, *ba],
+                text,
+                corner_radius: radius.first().copied(),
+            })
+        }
+        (_, []) => None,
+        _ => return Err("Expected two RGBA colors, an optional text color and an optional radius"),
+    })
+}
+
 async fn set_extension_active(app: &AppHandle, active: bool) {
-    EXTENSION_ACTIVE.store(active, Ordering::Relaxed);
+    let was_active = EXTENSION_ACTIVE.swap(active, Ordering::Relaxed);
     append_log(&format!(">>> gnome extension active={active}"));
     if active {
         stop_tray(app).await;
     } else {
+        if was_active {
+            popup::set_blur_palette(app, None);
+        }
         start_tray(app.clone()).await;
     }
 }
@@ -107,6 +156,25 @@ fn extension_dir() -> PathBuf {
 
 fn installed() -> bool {
     extension_dir().join("metadata.json").is_file()
+}
+
+/// `"version"` from an extension metadata.json.
+fn metadata_version(metadata: &str) -> Option<u64> {
+    let rest = metadata.split("\"version\"").nth(1)?;
+    let digits: String = rest
+        .trim_start_matches(|ch: char| ch == ':' || ch.is_whitespace())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+fn embedded_is_older() -> bool {
+    let installed = fs::read_to_string(extension_dir().join("metadata.json"))
+        .ok()
+        .and_then(|metadata| metadata_version(&metadata));
+    let embedded = metadata_version(FILES[0].1);
+    matches!((installed, embedded), (Some(installed), Some(embedded)) if embedded < installed)
 }
 
 fn write_files() -> std::io::Result<()> {
@@ -180,4 +248,31 @@ pub(crate) fn enable_gnome_integration() -> Result<GnomeStatus, String> {
     }
     gio::Settings::sync();
     Ok(status())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{metadata_version, parse_palette};
+
+    #[test]
+    fn reads_extension_metadata_version() {
+        assert_eq!(metadata_version("{\"uuid\": \"x\",\n  \"version\": 3\n}"), Some(3));
+        assert_eq!(metadata_version("{\"version\":12}"), Some(12));
+        assert_eq!(metadata_version("{}"), None);
+    }
+
+    #[test]
+    fn decodes_palette_with_and_without_text_and_radius() {
+        let base = [1, 2, 3, 4, 5, 6, 7, 8];
+        let p = parse_palette(true, &base).unwrap().unwrap();
+        assert_eq!((p.panel, p.bar, p.text, p.corner_radius), ([1, 2, 3, 4], [5, 6, 7, 8], None, None));
+        let p = parse_palette(true, &[&base[..], &[20]].concat()).unwrap().unwrap();
+        assert_eq!((p.text, p.corner_radius), (None, Some(20)));
+        let p = parse_palette(true, &[&base[..], &[9, 10, 11, 255]].concat()).unwrap().unwrap();
+        assert_eq!((p.text, p.corner_radius), (Some([9, 10, 11, 255]), None));
+        let p = parse_palette(true, &[&base[..], &[9, 10, 11, 255, 20]].concat()).unwrap().unwrap();
+        assert_eq!((p.text, p.corner_radius), (Some([9, 10, 11, 255]), Some(20)));
+        assert!(parse_palette(false, &[]).unwrap().is_none());
+        assert!(parse_palette(true, &[1, 2, 3]).is_err());
+    }
 }

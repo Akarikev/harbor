@@ -12,6 +12,7 @@ import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {PanelBlur} from './blur.js';
 
 const BUS_NAME = 'io.harbor.Harbor';
 const OBJECT_PATH = '/io/harbor/Harbor';
@@ -22,6 +23,15 @@ const APP_ID = 'io.harbor.app';
 // Matches #app's inset in src/styles.css.
 const CARD_INSET = 7;
 const LAUNCH_GRACE_US = 10 * GLib.USEC_PER_SEC;
+
+function cardRect(frame) {
+    return {
+        x: frame.x + CARD_INSET,
+        y: frame.y + CARD_INSET,
+        width: frame.width - 2 * CARD_INSET,
+        height: frame.height - 2 * CARD_INSET,
+    };
+}
 
 // Matched by the PID that owns harbor's D-Bus name, so it works whatever app id
 // or title GTK reports; app id is the fallback before harbor's PID is known.
@@ -112,15 +122,35 @@ class HarborButton extends PanelMenu.Button {
 export default class HarborExtension extends Extension {
     enable() {
         this._button = new HarborButton(this);
+        this._button.connect('destroy', () => (this._button = null));
         Main.panel.addToStatusArea(this.uuid, this._button);
+        // Like a tray icon: the button only exists while harbor is running.
+        this._button.container.hide();
+        this._blur = new PanelBlur(CARD_INSET, (active, colors) =>
+            Gio.DBus.session.call(BUS_NAME, OBJECT_PATH, INTERFACE, 'SetBlur',
+                new GLib.Variant('(bay)', [active, colors]), null,
+                Gio.DBusCallFlags.NO_AUTO_START, 2000, null, null));
         this._presence = Gio.bus_own_name(Gio.BusType.SESSION, PRESENCE_NAME,
-            Gio.BusNameOwnerFlags.NONE, null, null, null);
+            Gio.BusNameOwnerFlags.NONE, null, () => this._blur.refresh(true), null);
         this._harborPid = 0;
         this._harborWatch = Gio.bus_watch_name(Gio.BusType.SESSION, BUS_NAME,
             Gio.BusNameWatcherFlags.NONE,
-            () => lookupHarborPid(pid => (this._harborPid = pid)),
-            () => (this._harborPid = 0));
+            () => {
+                this._button?.container.show();
+                lookupHarborPid(pid => {
+                    if (this._button) {
+                        this._harborPid = pid;
+                        this._trackVisiblePopup();
+                    }
+                });
+                this._blur.refresh(true);
+            },
+            () => {
+                this._harborPid = 0;
+                this._button?.container.hide();
+            });
         this._tracked = new Map();
+        this._menuSources = new Set();
         this._laters = global.compositor?.get_laters?.();
         this._mapped = global.window_manager.connect('map',
             (_wm, actor) => this._onMap(actor.get_meta_window()));
@@ -148,6 +178,7 @@ export default class HarborExtension extends Extension {
                 const windows = app.get_windows();
                 return !windows.length || !windows.every(win => isHarborWindow(win, this._harborPid));
             }));
+        this._trackVisiblePopup();
     }
 
     disable() {
@@ -155,13 +186,24 @@ export default class HarborExtension extends Extension {
         global.stage.disconnect(this._outsideClick);
         global.display.disconnect(this._windowFocus);
         global.stage.disconnect(this._menuFocus);
+        this._stopMenuHover();
         this._injections.clear();
         for (const win of this._tracked.keys())
             this._untrack(win);
         Gio.bus_unwatch_name(this._harborWatch);
         Gio.bus_unown_name(this._presence);
-        this._button.destroy();
+        this._blur.destroy();
+        this._button?.destroy();
         this._button = null;
+    }
+
+    _trackVisiblePopup() {
+        // Shell may briefly reload us when another extension is toggled.
+        for (const actor of global.get_window_actors()) {
+            const win = actor.get_meta_window();
+            if (actor.mapped && actor.visible && !this._tracked.has(win))
+                this._onMap(win);
+        }
     }
 
     _onMap(win) {
@@ -181,8 +223,10 @@ export default class HarborExtension extends Extension {
 
     _present(win) {
         this._popup = win;
-        this._button.setPopupOpen(true);
+        this._button?.setPopupOpen(true);
         this._place(win);
+        this._blur.setWindow(win);
+        this._trackMenuHover();
         if (!win.has_focus())
             Main.activateWindow(win);
     }
@@ -200,7 +244,9 @@ export default class HarborExtension extends Extension {
             win.disconnect(id);
         if (this._popup === win) {
             this._popup = null;
-            this._button.setPopupOpen(false);
+            this._blur.setWindow(null);
+            this._stopMenuHover();
+            this._button?.setPopupOpen(false);
         }
     }
 
@@ -223,36 +269,64 @@ export default class HarborExtension extends Extension {
 
     _hide() {
         this._popup = null;
-        this._button.closePopup();
+        this._blur.setWindow(null);
+        this._stopMenuHover();
+        this._button?.closePopup();
+    }
+
+    _trackMenuHover() {
+        if (!this._button)
+            return;
+        const manager = Main.panel.menuManager;
+        for (const menu of manager._menus) {
+            const source = menu.sourceActor;
+            if (menu === this._button.menu || !source?.track_hover || this._menuSources.has(source))
+                continue;
+            this._menuSources.add(source);
+            // Panel actors own hover even when the preceding pointer events
+            // were routed to the Wayland popup instead of Shell's stage.
+            source.connectObject('notify::hover', () => {
+                if (this._popup && source.hover && !manager.activeMenu?.isOpen) {
+                    this._hide();
+                    menu.open();
+                }
+            }, 'destroy', () => this._menuSources.delete(source), this._button);
+        }
+    }
+
+    _stopMenuHover() {
+        if (this._button) {
+            for (const source of this._menuSources)
+                source.disconnectObject(this._button);
+        }
+        this._menuSources.clear();
     }
 
     _onCapturedEvent(event) {
         const type = event.type();
-        if (!this._button.menu.isOpen)
+        if (!this._button?.menu.isOpen)
             return Clutter.EVENT_PROPAGATE;
 
-        if (type === Clutter.EventType.MOTION) {
-            const manager = Main.panel.menuManager;
-            if (!manager.activeMenu) {
-                // With no modal grab the manager doesn't get the crossing events.
-                const target = global.stage.get_event_actor(event);
-                const menu = manager._findMenuForSource(target);
-                if (menu && menu !== this._button.menu) {
-                    this._hide();
-                    manager._changeMenu(menu);
-                }
-            }
-        } else if (type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.TOUCH_BEGIN) {
+        if (type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.TOUCH_BEGIN) {
             const [x, y] = event.get_coords();
             const [bx, by] = this._button.get_transformed_position();
             const [bw, bh] = this._button.get_transformed_size();
-            const f = this._popup?.get_frame_rect();
             const inside = (left, top, width, height) =>
                 x >= left && x < left + width && y >= top && y < top + height;
-            if (!inside(bx, by, bw, bh) &&
-                !(f && inside(f.x + CARD_INSET, f.y + CARD_INSET,
-                    f.width - 2 * CARD_INSET, f.height - 2 * CARD_INSET)))
-                this._hide();
+            if (inside(bx, by, bw, bh))
+                return Clutter.EVENT_PROPAGATE;
+            const frame = this._popup?.get_frame_rect();
+            if (frame) {
+                const card = cardRect(frame);
+                if (inside(card.x, card.y, card.width, card.height)) {
+                    const radius = Math.min(this._blur.cornerRadius, card.width / 2, card.height / 2);
+                    const dx = Math.max(0, radius - (x - card.x), x - (card.x + card.width - radius));
+                    const dy = Math.max(0, radius - (y - card.y), y - (card.y + card.height - radius));
+                    if (dx * dx + dy * dy <= radius * radius)
+                        return Clutter.EVENT_PROPAGATE;
+                }
+            }
+            this._hide();
         }
         return Clutter.EVENT_PROPAGATE;
     }
@@ -273,7 +347,7 @@ export default class HarborExtension extends Extension {
         const theme = menu?.get_theme_node();
         const rise = theme?.get_length('-arrow-rise') ?? 0;
         const gap = theme?.get_length('-boxpointer-gap') ?? 0;
-        const cardWidth = frame.width - 2 * CARD_INSET;
+        const {width: cardWidth} = cardRect(frame);
         const minX = area.x + rise;
         const maxX = Math.max(minX, area.x + area.width - cardWidth - rise);
         const cardX = Math.min(Math.max(buttonX + (buttonWidth - cardWidth) / 2, minX), maxX);
@@ -281,5 +355,6 @@ export default class HarborExtension extends Extension {
         const y = Math.round(Math.max(area.y, panelY + panelHeight + gap + rise) - CARD_INSET);
         if (frame.x !== x || frame.y !== y)
             win.move_frame(true, x, y);
+        this._blur.position();
     }
 }

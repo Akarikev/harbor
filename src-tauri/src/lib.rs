@@ -8,6 +8,7 @@ use tauri::{AppHandle, Manager};
 
 mod autostart;
 mod gnome;
+mod kde_blur;
 mod popup;
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -988,6 +989,7 @@ pub fn run() {
             open_in_browser,
             quit_app,
             popup::resize_popup,
+            popup::popup_ready,
             gnome::gnome_integration_status,
             gnome::enable_gnome_integration,
             autostart::autostart_enabled,

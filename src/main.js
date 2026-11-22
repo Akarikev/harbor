@@ -151,40 +151,58 @@ let latestScanRequest = 0;
 let expandedPort = null;
 let pendingKill = null;
 const killing = new Set();
+const copyTimers = new WeakMap();
 let toastTimer;
 let listScroll = 0;
 let resizeFrame = 0;
 let requestedHeight = 0;
 
 const icons = {
-  launch: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m6 9 3 3-3 3m6 0h5"/>',
   uptime: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   cpu: '<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3M9 9h6v6H9z"/>',
   memory: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M6 18v3m4-3v3m4-3v3m4-3v3M7 10v4m5-4v4m5-4v4"/>',
   bolt: '<path d="m13 2-8 12h6l-1 8 9-12h-6z"/>',
   open: '<path d="M13 4h7v7m0-7-9 9m-2-8H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3"/>',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  check: '<path d="m5 12 4 4L19 6"/>',
   close: '<path d="m6 6 12 12m0-12L6 18"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
   lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
 };
 const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name]}</svg>`;
 
+function applyPopupHeight() {
+  const content = settingsView.hidden ? portsView : settingsView;
+  const height = Math.ceil(content.getBoundingClientRect().height
+    + byId('header').offsetHeight + byId('footer').offsetHeight
+    + window.innerHeight - byId('app').clientHeight);
+  if (height === requestedHeight) return Promise.resolve();
+  requestedHeight = height;
+  return invokeCommand('resize_popup', { height }).catch((err) => {
+    requestedHeight = 0;
+    console.error('resize_popup failed:', err);
+  });
+}
+
 function sizePopup() {
   if (resizeFrame) return;
   resizeFrame = requestAnimationFrame(() => {
     resizeFrame = 0;
-    const content = settingsView.hidden ? portsView : settingsView;
-    const height = Math.ceil(content.getBoundingClientRect().height
-      + byId('header').offsetHeight + byId('footer').offsetHeight
-      + window.innerHeight - byId('app').clientHeight);
-    if (height === requestedHeight) return;
-    requestedHeight = height;
-    invokeCommand('resize_popup', { height }).catch((err) => {
-      requestedHeight = 0;
-      console.error('resize_popup failed:', err);
-    });
+    applyPopupHeight();
   });
+}
+
+// A freshly (re)created window stays unmapped until its first list is rendered
+// at its final height, so it appears once, complete, instead of growing on screen.
+let firstContentReady = false;
+async function markFirstContentReady() {
+  if (firstContentReady) return;
+  firstContentReady = true;
+  await applyPopupHeight();
+  // Not requestAnimationFrame: WebKit pauses it while the window is unmapped.
+  setTimeout(() => {
+    invokeCommand('popup_ready').catch((err) => console.error('popup_ready failed:', err));
+  }, 0);
 }
 
 function showSettings(open) {
@@ -216,7 +234,8 @@ function restartRefreshInterval() {
 }
 
 async function refresh({ supersede = false } = {}) {
-  if (!popupFocused || (scanInFlight && !supersede)) return;
+  // The first scan runs before the window is shown (and focused); later ones only while open.
+  if ((!popupFocused && firstContentReady) || (scanInFlight && !supersede)) return;
   const requestId = ++latestScanRequest;
   if (scanInFlight) return;
 
@@ -244,7 +263,8 @@ async function refresh({ supersede = false } = {}) {
   } finally {
     scanInFlight = false;
     loadingState.hidden = true;
-    sizePopup();
+    if (firstContentReady) sizePopup();
+    else markFirstContentReady();
     if (requestId !== latestScanRequest) refresh();
   }
 }
@@ -253,7 +273,7 @@ function button(action, label, graphic, style = '') {
   return `<button class="action ${style}" type="button" data-action="${action}" title="${label}" aria-label="${label}">${graphic}</button>`;
 }
 
-const rowLayoutTargets = '.meta, .meta .meta-item:not(.launch-meta), .action-group';
+const rowLayoutTargets = '.meta, .meta-item, .action-group';
 const rowLayoutObserver = new ResizeObserver((entries) => {
   const rows = new Set(entries.map(({ target }) => target.closest('.port-row')));
   for (const row of rows) {
@@ -272,29 +292,21 @@ const rowLayoutObserver = new ResizeObserver((entries) => {
 
 function fitMeta(meta, confirming) {
   const [values, energy] = meta.children;
-  const [launcher, uptime, cpu, memory] = values.children;
+  const [uptime, cpu, memory] = values.children;
+  if (!confirming) {
+    uptime.classList.remove('meta-overflow');
+    cpu.classList.remove('meta-overflow');
+    return;
+  }
   const gap = parseFloat(getComputedStyle(meta).columnGap);
-  const required = confirming ? memory : launcher.firstElementChild;
   const available = meta.getBoundingClientRect().width - energy.getBoundingClientRect().width
-    - required.getBoundingClientRect().width - gap;
-  const optional = (confirming ? [uptime, cpu] : [uptime, memory, cpu])
-    .map((item) => [item, item.getBoundingClientRect().width + gap]);
-  let used = optional.reduce((sum, [, width]) => sum + width, 0);
-  const needsRoom = used > available;
+    - memory.getBoundingClientRect().width - gap;
+  const cpuWidth = cpu.getBoundingClientRect().width + gap;
+  const uptimeWidth = uptime.getBoundingClientRect().width + gap;
 
   // Keep energy and RAM in confirmation, then drop uptime before CPU.
-  for (const [item, width] of optional) {
-    const omit = used > available;
-    item.classList.toggle('meta-overflow', omit);
-    if (omit) used -= width;
-  }
-  if (confirming) {
-    memory.classList.remove('meta-overflow');
-  } else {
-    const labelGap = parseFloat(getComputedStyle(launcher).columnGap);
-    launcher.lastElementChild.classList.toggle('icon-only', needsRoom || available - used - labelGap < 12);
-    launcher.classList.toggle('meta-overflow', available < 0);
-  }
+  uptime.classList.toggle('meta-overflow', uptimeWidth + cpuWidth > available);
+  cpu.classList.toggle('meta-overflow', cpuWidth > available);
 }
 
 function createRow(port) {
@@ -322,7 +334,6 @@ function createRow(port) {
         <button class="icon-button expand-btn" type="button" data-action="expand" aria-controls="details-${port}">${icon('chevron')}</button>
         <div class="meta">
           <div class="meta-values">
-            <span class="meta-item launch-meta" title="Launched from">${icon('launch')}<span class="launch-val"></span></span>
             <span class="meta-item" title="Uptime">${icon('uptime')}<span class="uptime-val"></span></span>
             <span class="meta-item" title="CPU">${icon('cpu')}<span class="cpu-val"></span></span>
             <span class="meta-item" title="Memory">${icon('memory')}<span class="mem-val"></span></span>
@@ -370,9 +381,6 @@ function updateRow(row, entry) {
       if (field.textContent !== String(value)) field.textContent = value;
     }
   }
-  const launcher = row.querySelector('.launch-meta');
-  const launcherTitle = `Launched from ${values['launch-val']}`;
-  if (launcher.dataset.tip !== launcherTitle) launcher.dataset.tip = launcherTitle;
   for (const field of row.getElementsByClassName('energy')) {
     const impact = energy.toLowerCase();
     if (field.dataset.impact !== impact) field.dataset.impact = impact;
@@ -491,11 +499,28 @@ async function killEntry(entry, pids, force) {
   }
 }
 
+function showCopyFeedback(button) {
+  const setIcon = (name, label) => {
+    button.innerHTML = icon(name);
+    button.removeAttribute('title');
+    button.dataset.tip = label;
+    button.setAttribute('aria-label', label);
+    if (tipTarget === button && !tip.hidden) tip.textContent = label;
+  };
+  clearTimeout(copyTimers.get(button));
+  setIcon('check', 'Copied');
+  copyTimers.set(button, setTimeout(() => {
+    setIcon('copy', 'Copy port');
+    copyTimers.delete(button);
+  }, 1200));
+}
+
 portList.addEventListener('click', async (event) => {
   const top = event.target.closest('.row-top');
   if (!top) return;
   const port = Number(top.closest('.port-row').dataset.port);
-  const action = event.target.closest('[data-action]')?.dataset.action || 'expand';
+  const actionButton = event.target.closest('[data-action]');
+  const action = actionButton?.dataset.action || 'expand';
   const entry = ports.find((item) => item.port === port);
   if (!entry) return;
 
@@ -520,7 +545,7 @@ portList.addEventListener('click', async (event) => {
     case 'copy':
       try {
         await navigator.clipboard.writeText(String(port));
-        showToast(`Copied :${port}`, 'success');
+        showCopyFeedback(actionButton);
       } catch (_) {
         showToast('Failed to copy port.');
       }
@@ -610,6 +635,12 @@ for (const gesture of ['gesturestart', 'gesturechange']) {
   window.addEventListener(gesture, (event) => event.preventDefault(), { passive: false });
 }
 window.addEventListener('dragstart', (event) => event.preventDefault());
+document.addEventListener('pointerdown', (event) => {
+  // The compositor can route transparent-corner clicks to the WebView.
+  if (!event.target.closest('#app')) {
+    getCurrentAppWindow().hide().catch((err) => console.error('window hide failed:', err));
+  }
+});
 window.addEventListener('keydown', (event) => {
   if (((event.ctrlKey || event.metaKey) && ['=', '+', '-', '_', '0'].includes(event.key))
     || event.key === 'Backspace' || (event.altKey && event.key === 'ArrowLeft')) {
@@ -643,6 +674,8 @@ async function init() {
   const focusEventCountAtQuery = focusEventCount;
   const focused = await appWindow.isFocused();
   if (focusEventCountAtQuery === focusEventCount) handlePopupFocus(focused);
+  // Load the list before the window is shown; markFirstContentReady() then maps it.
+  if (!firstContentReady) refresh();
 }
 
 

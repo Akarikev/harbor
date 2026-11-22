@@ -6,14 +6,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, PhysicalRect, WebviewWindow, WebviewWindowBuilder};
-use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebViewExt};
 
 use crate::append_log;
 
-const POPUP_WIDTH: f64 = 400.0;
+const POPUP_WIDTH: f64 = 376.0;
 const MARGIN: i32 = 12;
 const WEBVIEW_IDLE: Duration = Duration::from_secs(60);
-const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(300);
+// Fallback only: the page normally reports popup_ready after its first list is
+// rendered and sized. Never leave the popup invisible if that signal is lost.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlacementMode {
@@ -25,6 +26,16 @@ pub(super) enum PlacementMode {
 struct PopupPlacement {
     mode: PlacementMode,
     lifecycle: Mutex<PopupLifecycle>,
+    blur_palette: Mutex<Option<BlurPalette>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct BlurPalette {
+    pub panel: [u8; 4],
+    pub bar: [u8; 4],
+    /// The shell theme's menu text colour, when the extension provides it.
+    pub text: Option<[u8; 4]>,
+    pub corner_radius: Option<u8>,
 }
 
 #[derive(Default)]
@@ -76,6 +87,7 @@ pub(super) fn setup(app: &AppHandle, mode: PlacementMode) {
     app.manage(PopupPlacement {
         mode,
         lifecycle: Mutex::default(),
+        blur_palette: Mutex::default(),
     });
     append_log(&format!(">>> placement mode: {}", mode.name()));
     if let Some(settings) = gtk::Settings::default() {
@@ -85,6 +97,58 @@ pub(super) fn setup(app: &AppHandle, mode: PlacementMode) {
                 let _ = window.eval(font_script());
             }
         });
+    }
+}
+
+fn blur_script(palette: Option<BlurPalette>) -> String {
+    let blurred = palette.is_some();
+    let radius = palette
+        .and_then(|palette| palette.corner_radius)
+        .map_or_else(String::new, |radius| format!("{radius}px"));
+    let (panel, bar) = palette.map_or_else(
+        || (String::new(), String::new()),
+        |palette| {
+            // Use the desktop's menu tint as-is so harbor looks like the other panel
+            // menus; readability comes from menu-style light text (styles.css).
+            let rgba = |[r, g, b, a]: [u8; 4]| format!("rgba({r},{g},{b},{})", f64::from(a) / 255.0);
+            (rgba(palette.panel), rgba(palette.bar))
+        },
+    );
+    // Opaque text in the theme's colour; secondary text is a solid mix of it
+    // (not alpha, which lets the background bleed through the glyphs).
+    let (text, muted) = palette.and_then(|palette| palette.text).map_or_else(
+        || (String::new(), String::new()),
+        |[r, g, b, _]| {
+            let text = format!("rgb({r},{g},{b})");
+            let muted = format!("color-mix(in srgb, {text} 74%, #7c7c80)");
+            (text, muted)
+        },
+    );
+    format!(r#"(() => {{
+        const apply = () => {{
+            const root = document.documentElement;
+            const style = root.style;
+            root.toggleAttribute('data-system-blur', {blurred});
+            style.setProperty('--panel-top', '{panel}');
+            style.setProperty('--panel-bottom', '{panel}');
+            style.setProperty('--bar', '{bar}');
+            style.setProperty('--card-radius', '{radius}');
+            style.setProperty('--text', '{text}');
+            style.setProperty('--muted', '{muted}');
+        }};
+        if (document.documentElement) apply();
+        else document.addEventListener('DOMContentLoaded', apply, {{ once: true }});
+    }})()"#)
+}
+
+pub(super) fn set_blur_palette(app: &AppHandle, palette: Option<BlurPalette>) {
+    let state = app.state::<PopupPlacement>();
+    let mut current = state.blur_palette.lock().unwrap();
+    if *current != palette {
+        *current = palette;
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.eval(blur_script(palette));
+        }
     }
 }
 
@@ -168,6 +232,7 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
         .ok_or(tauri::Error::WindowNotFound)?;
     let window = WebviewWindowBuilder::from_config(app, config)?
         .initialization_script(font_script())
+        .initialization_script(blur_script(*app.state::<PopupPlacement>().blur_palette.lock().unwrap()))
         .build()?;
     let gtk_window = window.gtk_window()?;
     if mode == PlacementMode::LayerShell && !gtk_window.is_realized() {
@@ -181,39 +246,14 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
     if mode != PlacementMode::X11 && !gtk_window.is_layer_window() {
         gtk_window.set_position(gtk::WindowPosition::Center);
     }
+    crate::kde_blur::install(app, &gtk_window);
 
     // Present once GTK has mapped the window.
     gtk_window.connect_map(|window| window.present());
     let handle = app.clone();
     gtk_window.connect_unmap(move |_| schedule_idle_destruction(&handle));
-    let handle = app.clone();
     window.with_webview(move |platform| {
         let view = platform.inner();
-        view.connect_load_changed(move |view, event| {
-            if event != LoadEvent::Finished || handle.state::<PopupPlacement>().lifecycle().ready {
-                return;
-            }
-            let app = handle.clone();
-            let view_ref = view.downgrade();
-            // An unmapped WebView does not get compositor frames. Render the
-            // styled document offscreen before letting GTK map the toplevel.
-            view.snapshot(
-                SnapshotRegion::FullDocument,
-                SnapshotOptions::NONE,
-                gio::Cancellable::NONE,
-                move |result| {
-                    if let Err(error) = result {
-                        append_log(&format!(">>> initial webview snapshot failed: {error}"));
-                    } else if let Some(window) = view_ref
-                        .upgrade()
-                        .and_then(|view| view.toplevel())
-                        .and_downcast::<gtk::ApplicationWindow>()
-                    {
-                        first_frame_ready(&app, &window);
-                    }
-                },
-            );
-        });
         view.set_property("zoom-level", 1.0_f64);
         #[cfg(not(debug_assertions))]
         view.connect_local("context-menu", false, |_| Some(true.to_value()));
@@ -235,6 +275,9 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
     let handle = app.clone();
     glib::timeout_add_local_once(FIRST_FRAME_TIMEOUT.saturating_sub(start.elapsed()), move || {
         if let Some(window) = native.upgrade() {
+            if !handle.state::<PopupPlacement>().lifecycle().ready {
+                append_log(">>> popup ready (fallback timeout)");
+            }
             first_frame_ready(&handle, &window);
         }
     });
@@ -243,6 +286,15 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
         start.elapsed().as_millis()
     ));
     Ok(window)
+}
+
+/// The page has rendered its first list at its final height: map the window now.
+#[tauri::command]
+pub(super) fn popup_ready(window: WebviewWindow) {
+    if let Ok(gtk_window) = window.gtk_window() {
+        append_log(">>> popup ready (page rendered)");
+        first_frame_ready(window.app_handle(), &gtk_window);
+    }
 }
 
 fn first_frame_ready(app: &AppHandle, window: &gtk::ApplicationWindow) {
@@ -508,9 +560,9 @@ mod tests {
             position: (0, 32).into(),
             size: (1920, 1048).into(),
         };
-        assert_eq!(x11_popup_position(Some(1255.0), work_area, 1.0), (1055, 44).into());
-        assert_eq!(x11_popup_position(Some(1919.0), work_area, 1.0), (1508, 44).into());
-        assert_eq!(x11_popup_position(None, work_area, 1.0), (1508, 44).into());
+        assert_eq!(x11_popup_position(Some(1255.0), work_area, 1.0), (1067, 44).into());
+        assert_eq!(x11_popup_position(Some(1919.0), work_area, 1.0), (1532, 44).into());
+        assert_eq!(x11_popup_position(None, work_area, 1.0), (1532, 44).into());
     }
 
     #[test]
@@ -519,7 +571,7 @@ mod tests {
             position: (-2560, 200).into(),
             size: (2560, 1440).into(),
         };
-        assert_eq!(x11_popup_position(Some(-1280.0), work_area, 2.0), (-1680, 224).into());
-        assert_eq!(x11_popup_position(Some(-20.0), work_area, 2.0), (-824, 224).into());
+        assert_eq!(x11_popup_position(Some(-1280.0), work_area, 2.0), (-1656, 224).into());
+        assert_eq!(x11_popup_position(Some(-20.0), work_area, 2.0), (-776, 224).into());
     }
 }
