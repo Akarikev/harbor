@@ -36,6 +36,9 @@
             <label class="settings-row" for="show-all-settings">Show all ports
               <input class="switch" type="checkbox" id="show-all-settings" role="switch" />
             </label>
+            <label class="settings-row" for="autostart-toggle">Start at login
+              <input class="switch" type="checkbox" id="autostart-toggle" role="switch" />
+            </label>
             <label class="settings-row" for="refresh-select">Refresh interval
               <select id="refresh-select">
                 <option value="2000">Every 2 seconds</option>
@@ -67,6 +70,15 @@
                 <option value="dark">Dark</option>
               </select>
             </label>
+          </section>
+          <section class="settings-section" id="gnome-section" aria-labelledby="gnome-title" hidden>
+            <h2 id="gnome-title">GNOME</h2>
+            <div class="settings-row">
+              <span>Top-bar button
+                <small id="gnome-status" class="settings-note"></small>
+              </span>
+              <button id="gnome-enable" class="pill-button" type="button">Enable</button>
+            </div>
           </section>
         </section>
       </main>

@@ -280,11 +280,65 @@ svg {
 .stats dt, .settings-section h2 { font-size: 10px; font-weight: 700; letter-spacing: .055em; text-transform: uppercase; }
 .stats dd { margin: 2px 0 0; color: var(--text); }
 
-#settings-view { padding: 11px 15px 14px; }
-.settings-section + .settings-section { margin-top: 11px; }
-.settings-section h2 { margin: 0 0 3px; color: var(--muted); }
-.settings-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; border-bottom: 1px solid var(--line); }
-.settings-row select { max-width: 55%; padding: 3px 5px; border: 1px solid var(--line); border-radius: 6px; background: var(--control); font-size: 12px; }
+/* Settings: one control style, one row rhythm. Sections are grouped cards so
+   separators only sit between rows, never dangling under the last one. */
+#settings-view { padding: 12px 13px 14px; }
+.settings-section + .settings-section { margin-top: 14px; }
+.settings-section h2 { margin: 0 0 6px 2px; color: var(--muted); }
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-bottom-width: 0;
+  background: var(--hover);
+}
+.settings-section h2 + .settings-row { border-radius: 9px 9px 0 0; }
+.settings-row:last-child { border-bottom-width: 1px; border-radius: 0 0 9px 9px; }
+.settings-section h2 + .settings-row:last-child { border-radius: 9px; }
+/* Same size and look for every control on the right. */
+.settings-row .dropdown, .pill-button {
+  flex: none;
+  width: 132px;
+  height: 26px;
+  padding: 0 24px 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--control);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+}
+.settings-row .dropdown {
+  position: relative;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 13px) 11px, calc(100% - 9px) 11px;
+  background-size: 4px 4px;
+  background-repeat: no-repeat;
+}
+.dropdown span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-row { position: relative; }
+.dropdown-list {
+  position: absolute;
+  right: 10px;
+  top: calc(100% - 4px);
+  z-index: 5;
+  width: 132px;
+  padding: 4px;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: var(--bar);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .22);
+}
+.dropdown-list.up { top: auto; bottom: calc(100% - 4px); }
+.dropdown-option { padding: 5px 8px; border-radius: 6px; font-size: 12px; cursor: pointer; outline: none; }
+.dropdown-option:hover, .dropdown-option:focus { background: var(--hover); }
+.dropdown-option[aria-selected="true"] { color: var(--accent); font-weight: 500; }
+.settings-row .dropdown:focus-visible, .pill-button:focus-visible { outline: none; border-color: var(--accent); }
 
 #toast {
   position: absolute;
@@ -315,3 +369,7 @@ svg {
   box-shadow: 0 1px 3px rgba(0, 0, 0, .18);
   pointer-events: none;
 }
+
+.settings-note { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+.pill-button { padding: 0 9px; text-align: center; }
+.pill-button:disabled { cursor: default; opacity: .6; }

@@ -597,6 +597,9 @@ function handlePopupFocus(focused) {
   } else {
     ++latestScanRequest;
     setPendingKill(null);
+    // The popup hides on focus loss; the next open always starts on the port list.
+    closeDropdowns();
+    if (!settingsView.hidden) showSettings(false);
   }
 }
 
@@ -623,6 +626,7 @@ async function init() {
   refreshSelect.value = String(getSavedRefreshInterval());
   confirmKillToggle.checked = getSavedConfirmBeforeKill();
   killActionSelect.value = getSavedKillAction();
+  syncDropdowns();
   setShowAll(getSavedShowAll());
   applyTheme();
   const resizeObserver = new ResizeObserver(sizePopup);
@@ -641,7 +645,6 @@ async function init() {
   if (focusEventCountAtQuery === focusEventCount) handlePopupFocus(focused);
 }
 
-init().catch((err) => console.error('window initialization failed:', err));
 
 // ─── Tooltips ────────────────────────────────────────────────────────────────
 // Native title tooltips are drawn by GTK with a boxed background we can't style,
@@ -691,18 +694,174 @@ document.addEventListener('mousedown', hideTip);
 document.addEventListener('scroll', hideTip, true);
 window.addEventListener('blur', hideTip);
 
-// Native <select> menus open as separate GTK popups and take focus; keep the popup
-// open meanwhile, and hide it afterwards if the user clicked outside harbor.
-for (const select of document.querySelectorAll('select')) {
-  const hold = () => invokeCommand('popup_hold', { hold: true }).catch(() => {});
-  const release = () => setTimeout(() => {
-    invokeCommand('popup_hold', { hold: false }).catch(() => {});
-    if (!document.hasFocus()) getCurrentAppWindow().hide().catch(() => {});
-  }, 150);
-  select.addEventListener('mousedown', hold);
-  select.addEventListener('keydown', (event) => {
-    if ([' ', 'Enter', 'ArrowDown', 'ArrowUp'].includes(event.key)) hold();
-  });
-  select.addEventListener('change', release);
-  select.addEventListener('blur', release);
+
+// ─── GNOME integration ───────────────────────────────────────────────────────
+const gnomeSection = byId('gnome-section');
+const gnomeStatus = byId('gnome-status');
+const gnomeEnable = byId('gnome-enable');
+
+function showGnomeStatus(status) {
+  gnomeSection.hidden = !status.available;
+  if (!status.available) return;
+  let note;
+  if (status.active) note = 'Active. harbor opens from its own top-bar button.';
+  else if (status.user_extensions_disabled) note = 'Extensions are turned off in GNOME. Turn them on in the Extensions app.';
+  else if (status.enabled) note = 'Installed. Log out and back in to finish.';
+  else note = 'Opens harbor under its own top-bar button with one click.';
+  gnomeStatus.textContent = note;
+  gnomeEnable.hidden = status.enabled || status.active;
 }
+
+async function refreshGnomeStatus() {
+  try {
+    showGnomeStatus(await invokeCommand('gnome_integration_status'));
+  } catch (err) {
+    console.error('gnome_integration_status failed:', err);
+  }
+}
+
+gnomeEnable.addEventListener('click', async () => {
+  gnomeEnable.disabled = true;
+  try {
+    showGnomeStatus(await invokeCommand('enable_gnome_integration'));
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : String(err));
+  } finally {
+    gnomeEnable.disabled = false;
+  }
+});
+
+settingsBtn.addEventListener('click', refreshGnomeStatus);
+
+// ─── In-page dropdowns ───────────────────────────────────────────────────────
+// A native <select> opens its menu as a separate GTK popup window, which takes
+// focus from harbor and closes the popup. These menus live inside the page, so
+// focus never leaves. The hidden <select> stays the source of truth: it holds the
+// value and fires 'change', so the settings code above is unchanged.
+const dropdowns = [];
+
+function syncDropdowns() {
+  for (const { select, label } of dropdowns) {
+    label.textContent = select.selectedOptions[0]?.textContent ?? '';
+  }
+}
+
+function closeDropdowns(except) {
+  for (const dropdown of dropdowns) {
+    if (dropdown !== except && !dropdown.list.hidden) {
+      dropdown.list.hidden = true;
+      dropdown.button.setAttribute('aria-expanded', 'false');
+    }
+  }
+}
+
+for (const select of document.querySelectorAll('.settings-row select')) {
+  select.hidden = true;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'dropdown';
+  button.setAttribute('aria-haspopup', 'listbox');
+  button.setAttribute('aria-expanded', 'false');
+  const label = document.createElement('span');
+  button.append(label);
+  const list = document.createElement('div');
+  list.className = 'dropdown-list';
+  list.setAttribute('role', 'listbox');
+  list.hidden = true;
+  const dropdown = { select, button, label, list };
+  for (const option of select.options) {
+    const item = document.createElement('div');
+    item.className = 'dropdown-option';
+    item.setAttribute('role', 'option');
+    item.tabIndex = -1;
+    item.dataset.value = option.value;
+    item.textContent = option.textContent;
+    list.append(item);
+  }
+  const options = () => [...list.children];
+  const open = () => {
+    closeDropdowns(dropdown);
+    for (const item of options()) item.setAttribute('aria-selected', String(item.dataset.value === select.value));
+    list.hidden = false;
+    // Open upward when the menu would run past the bottom of the popup.
+    list.classList.remove('up');
+    const viewportBottom = viewport.getBoundingClientRect().bottom;
+    list.classList.toggle('up', list.getBoundingClientRect().bottom > viewportBottom);
+    button.setAttribute('aria-expanded', 'true');
+    (options().find((item) => item.dataset.value === select.value) ?? options()[0]).focus();
+  };
+  const close = (refocus) => {
+    list.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    if (refocus) button.focus();
+  };
+  const choose = (item) => {
+    if (select.value !== item.dataset.value) {
+      select.value = item.dataset.value;
+      select.dispatchEvent(new Event('change'));
+    }
+    syncDropdowns();
+    close(true);
+  };
+  button.addEventListener('click', () => (list.hidden ? open() : close(true)));
+  button.addEventListener('keydown', (event) => {
+    if (['ArrowDown', 'ArrowUp'].includes(event.key)) {
+      event.preventDefault();
+      open();
+    }
+  });
+  list.addEventListener('click', (event) => {
+    const item = event.target.closest('.dropdown-option');
+    if (item) choose(item);
+  });
+  list.addEventListener('keydown', (event) => {
+    const items = options();
+    const index = items.indexOf(document.activeElement);
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      items[(index + step + items.length) % items.length].focus();
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (index >= 0) choose(items[index]);
+    } else if (event.key === 'Escape' || event.key === 'Tab') {
+      // Escape closes only the menu, not the whole popup.
+      event.preventDefault();
+      event.stopPropagation();
+      close(true);
+    }
+  });
+  // The row's <label for> pointed at the select; point it at the visible control.
+  button.id = `${select.id}-button`;
+  select.closest('label')?.setAttribute('for', button.id);
+  select.after(button, list);
+  dropdowns.push(dropdown);
+}
+document.addEventListener('mousedown', (event) => {
+  if (!event.target.closest('.dropdown, .dropdown-list')) closeDropdowns();
+});
+
+// ─── Start at login ──────────────────────────────────────────────────────────
+const autostartToggle = byId('autostart-toggle');
+
+async function refreshAutostart() {
+  try {
+    autostartToggle.checked = await invokeCommand('autostart_enabled');
+  } catch (err) {
+    console.error('autostart_enabled failed:', err);
+  }
+}
+
+autostartToggle.addEventListener('change', async () => {
+  try {
+    autostartToggle.checked = await invokeCommand('set_autostart', { enabled: autostartToggle.checked });
+  } catch (err) {
+    autostartToggle.checked = !autostartToggle.checked;
+    showToast(err instanceof Error ? err.message : String(err));
+  }
+});
+
+settingsBtn.addEventListener('click', refreshAutostart);
+
+// Start last, after every module-level setup above (tooltips, dropdowns, GNOME) has run.
+init().catch((err) => console.error('window initialization failed:', err));

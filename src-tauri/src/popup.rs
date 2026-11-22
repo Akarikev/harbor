@@ -1,7 +1,6 @@
 use gtk::{gdk, gio, glib, pango, prelude::*};
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
     env,
     sync::Mutex,
     time::{Duration, Instant},
@@ -260,14 +259,6 @@ pub(super) fn on_destroyed(app: &AppHandle) {
     }
 }
 
-static HOLD_OPEN: AtomicBool = AtomicBool::new(false);
-
-/// Keep the popup open while one of its native menus (e.g. a <select>) has focus.
-#[tauri::command]
-pub(super) fn popup_hold(hold: bool) {
-    HOLD_OPEN.store(hold, Ordering::Relaxed);
-}
-
 pub(super) fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if window.label() != "main" {
         return;
@@ -277,11 +268,6 @@ pub(super) fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent
     };
     append_log(&format!(">>> popup focus={focused}"));
     if *focused {
-        HOLD_OPEN.store(false, Ordering::Relaxed);
-        return;
-    }
-    // A native <select> menu is a separate GTK popup; opening it steals focus from the popup.
-    if HOLD_OPEN.load(Ordering::Relaxed) {
         return;
     }
     if let Some(placement) = window.try_state::<PopupPlacement>() {

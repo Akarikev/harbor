@@ -6,6 +6,8 @@ use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
+mod autostart;
+mod gnome;
 mod popup;
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -854,7 +856,39 @@ impl ksni::Tray for HarborTray {
     }
 }
 
-async fn start_tray(app: AppHandle) -> Result<(), String> {
+/// The tray icon, or None while the GNOME extension provides the panel button.
+#[derive(Default)]
+struct TrayState(std::sync::Mutex<Option<ksni::Handle<HarborTray>>>);
+
+/// Start the tray icon if it isn't running. Failures are logged; the popup stays
+/// reachable through single-instance launches.
+async fn start_tray(app: AppHandle) {
+    let state = app.state::<TrayState>();
+    if state.0.lock().unwrap_or_else(|err| err.into_inner()).is_some() {
+        return;
+    }
+    match spawn_tray(app.clone()).await {
+        Ok(handle) => {
+            *state.0.lock().unwrap_or_else(|err| err.into_inner()) = Some(handle);
+            append_log(">>> tray service started via ksni");
+        }
+        Err(err) => {
+            let message = format!(">>> tray startup failed: {err}");
+            append_log(&message);
+            eprintln!("{message}");
+        }
+    }
+}
+
+async fn stop_tray(app: &AppHandle) {
+    let handle = app.state::<TrayState>().0.lock().unwrap_or_else(|err| err.into_inner()).take();
+    if let Some(handle) = handle {
+        handle.shutdown().await;
+        append_log(">>> tray service stopped (GNOME extension active)");
+    }
+}
+
+async fn spawn_tray(app: AppHandle) -> Result<ksni::Handle<HarborTray>, String> {
     let image = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
         .map_err(|err| err.to_string())?;
     let icon = ksni::Icon {
@@ -866,18 +900,11 @@ async fn start_tray(app: AppHandle) -> Result<(), String> {
             .flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]])
             .collect(),
     };
-    let tray = HarborTray {
-        app: app.clone(),
-        icon,
-    };
-    let handle = tray
+    HarborTray { app, icon }
         .assume_sni_available(true)
         .spawn()
         .await
-        .map_err(|err| err.to_string())?;
-    app.manage(handle);
-    append_log(">>> tray service started via ksni");
-    Ok(())
+        .map_err(|err| err.to_string())
 }
 
 // ─── App Entry ────────────────────────────────────────────────────────────────
@@ -945,14 +972,10 @@ pub fn run() {
         .setup(move |app| {
             popup::setup(app.handle(), placement_mode);
 
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(err) = start_tray(handle).await {
-                    let message = format!(">>> tray startup failed: {err}");
-                    append_log(&message);
-                    eprintln!("{message}");
-                }
-            });
+            app.manage(TrayState::default());
+            // Serves the extension's D-Bus API and starts the tray icon unless the
+            // GNOME extension is active.
+            tauri::async_runtime::spawn(gnome::run(app.handle().clone()));
 
             if !std::env::args_os().skip(1).any(|arg| arg == "--hidden") {
                 popup::request(app.handle(), None, startup_token);
@@ -965,7 +988,10 @@ pub fn run() {
             open_in_browser,
             quit_app,
             popup::resize_popup,
-            popup::popup_hold
+            gnome::gnome_integration_status,
+            gnome::enable_gnome_integration,
+            autostart::autostart_enabled,
+            autostart::set_autostart
         ])
         .build(context)
         .expect("error while building harbor")

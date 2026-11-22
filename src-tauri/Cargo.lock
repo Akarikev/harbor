@@ -1459,6 +1459,7 @@ dependencies = [
 name = "harbor"
 version = "0.1.0"
 dependencies = [
+ "futures-lite",
  "gtk",
  "gtk-layer-shell",
  "ksni",
@@ -1468,6 +1469,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "zbus",
 ]
 
 [[package]]
