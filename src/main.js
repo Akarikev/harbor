@@ -207,25 +207,7 @@ function getKillPids(entry) {
 }
 
 function isProtectedEntry(entry) {
-  if (Number(entry?.pid) <= 0) return true;
-
-  const name = String(entry?.process_name || '').toLowerCase();
-  const cmdline = String(entry?.cmdline || '').toLowerCase();
-  const hay = `${name} ${cmdline}`;
-
-  // Never lock local app servers in the UI (Next clears/rewrites cmdline).
-  if (
-    hay.includes('next-server')
-    || hay.includes('next')
-    || hay.includes('vite')
-    || hay.includes('nuxt')
-    || hay.includes('openclaw')
-    || hay.includes('tauri')
-  ) {
-    return false;
-  }
-
-  return Boolean(entry?.is_protected);
+  return Boolean(entry.is_protected) || Number(entry.pid) <= 0;
 }
 
 function getSavedTheme() {

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
@@ -273,10 +274,6 @@ fn get_process_uid(pid: u32) -> Option<u32> {
         .and_then(|value| value.parse::<u32>().ok())
 }
 
-fn is_path_under_home(path: &str) -> bool {
-    path.starts_with("/home/") || path.starts_with("/Users/")
-}
-
 fn is_known_system_process(name: &str, cmdline: &str, exe: &str) -> bool {
     let hay = format!("{name} {cmdline} {exe}").to_lowercase();
     const MARKERS: &[&str] = &[
@@ -320,66 +317,20 @@ fn is_known_system_process(name: &str, cmdline: &str, exe: &str) -> bool {
     MARKERS.iter().any(|marker| hay.contains(marker))
 }
 
-fn is_local_dev_server(name: &str, cmdline: &str, exe: &str, cwd: &str) -> bool {
-    let lower = format!("{name} {cmdline} {exe} {cwd}").to_lowercase();
-
-    // Explicit app/dev servers — including Next's rewritten process title.
-    if lower.contains("next")
-        || lower.contains("vite")
-        || lower.contains("nuxt")
-        || lower.contains("webpack")
-        || lower.contains("remix")
-        || lower.contains("astro")
-        || lower.contains("react-scripts")
-        || lower.contains("openclaw")
-        || lower.contains("tauri")
-    {
-        return true;
-    }
-
-    // Known desktop/system apps are never "local servers".
-    if is_known_system_process(name, cmdline, exe) {
-        return false;
-    }
-
-    let under_home = is_path_under_home(cwd) || is_path_under_home(exe);
-    // Only JS runtimes auto-qualify from $HOME — system python apps (ulauncher)
-    // also have a home cwd and must not be treated as killable servers.
-    let is_js_runtime = lower.contains("node") || lower.contains("bun") || lower.contains("deno");
-
-    under_home && is_js_runtime
+fn compute_is_protected(pid: u32, uid: u32, euid: u32, is_system: bool) -> bool {
+    pid == 0 || is_system || uid != euid
 }
 
-fn compute_is_protected(pid: u32, uid: u32, name: &str, cmdline: &str, cwd: &str) -> bool {
-    if pid == 0 {
-        return true;
-    }
-
-    let exe = get_process_exe(pid);
-
-    // Desktop/system services first (ulauncher etc. can have a $HOME cwd).
-    if is_known_system_process(name, cmdline, &exe) {
-        return true;
-    }
-
-    // Local app servers stay killable.
-    if is_local_dev_server(name, cmdline, &exe, cwd) {
-        return false;
-    }
-
-    if uid != current_euid() {
-        return true;
-    }
-
-    false
+fn is_process_protected(pid: u32, uid: u32, name: &str, cmdline: &str) -> bool {
+    let is_system = pid != 0 && is_known_system_process(name, cmdline, &get_process_exe(pid));
+    compute_is_protected(pid, uid, current_euid(), is_system)
 }
 
 fn is_pid_protected(pid: u32) -> bool {
     let uid = get_process_uid(pid).unwrap_or_else(current_euid);
     let cmdline = get_cmdline(pid);
-    let cwd = get_process_cwd(pid);
     let name = resolve_display_name(pid, "", &cmdline);
-    compute_is_protected(pid, uid, &name, &cmdline, &cwd)
+    is_process_protected(pid, uid, &name, &cmdline)
 }
 
 fn make_port_entry(
@@ -394,7 +345,7 @@ fn make_port_entry(
     uptime_seconds: u64,
 ) -> PortEntry {
     let uid = get_process_uid(pid).unwrap_or_else(current_euid);
-    let is_protected = compute_is_protected(pid, uid, &process_name, &cmdline, &cwd);
+    let is_protected = is_process_protected(pid, uid, &process_name, &cmdline);
 
     PortEntry {
         port,
@@ -472,12 +423,24 @@ fn kill_process_tree(pid: u32, signal: i32) -> Result<(), String> {
 }
 
 fn num_cpus() -> f32 {
-    fs::read_to_string("/proc/cpuinfo")
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| l.starts_with("processor"))
-        .count()
-        .max(1) as f32
+    static NUM_CPUS: OnceLock<f32> = OnceLock::new();
+    *NUM_CPUS.get_or_init(|| {
+        fs::read_to_string("/proc/cpuinfo")
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("processor"))
+            .count()
+            .max(1) as f32
+    })
+}
+
+fn parse_proc_stat(stat: &str) -> Option<(u64, u64, u64)> {
+    // Field 3 (state) follows the final ')' of field 2 (comm).
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let utime = fields.nth(14 - 3)?.parse().ok()?;
+    let stime = fields.next()?.parse().ok()?;
+    let starttime = fields.nth(22 - 16)?.parse().ok()?;
+    Some((utime, stime, starttime))
 }
 
 fn get_process_stats(pid: u32) -> (f32, f32, u64) {
@@ -492,23 +455,37 @@ fn get_process_stats(pid: u32) -> (f32, f32, u64) {
 
     let (cpu_percent, uptime_secs) = (|| -> Option<(f32, u64)> {
         let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-        let fields: Vec<&str> = stat.split_whitespace().collect();
-        let utime: u64 = fields.get(13)?.parse().ok()?;
-        let stime: u64 = fields.get(14)?.parse().ok()?;
-        let starttime: u64 = fields.get(21)?.parse().ok()?;
+        let (utime, stime, starttime) = parse_proc_stat(&stat)?;
         let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
         let uptime: f64 = uptime_str.split_whitespace().next()?.parse().ok()?;
-        let clk_tck = 100u64;
-        let seconds = uptime - (starttime as f64 / clk_tck as f64);
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let clk_tck = if clk_tck > 0 { clk_tck as f64 } else { 100.0 };
+        let seconds = uptime - (starttime as f64 / clk_tck);
         if seconds <= 0.0 {
             return Some((0.0, 0));
         }
-        let cpu = ((utime + stime) as f64 / clk_tck as f64 / seconds * 100.0) as f32;
+        let cpu = ((utime + stime) as f64 / clk_tck / seconds * 100.0) as f32;
         Some((cpu.min(100.0 * num_cpus()), seconds as u64))
     })()
     .unwrap_or((0.0, 0));
 
     (cpu_percent, mem_mb, uptime_secs)
+}
+
+fn merge_entries_by_port(entries: Vec<PortEntry>) -> Vec<PortEntry> {
+    let mut by_port = BTreeMap::new();
+    for mut entry in entries {
+        let pids = std::mem::take(&mut entry.pids);
+        let is_protected = entry.is_protected;
+        let merged = by_port.entry(entry.port).or_insert(entry);
+        merged.is_protected |= is_protected;
+        for pid in pids {
+            if !merged.pids.contains(&pid) {
+                merged.pids.push(pid);
+            }
+        }
+    }
+    by_port.into_values().collect()
 }
 
 // ─── Port scanning via `ss` (fast) ───────────────────────────────────────────
@@ -580,8 +557,7 @@ fn scan_with_ss(show_all: bool) -> Option<Vec<PortEntry>> {
         ));
     }
 
-    entries.sort_by_key(|e| e.port);
-    Some(entries)
+    Some(merge_entries_by_port(entries))
 }
 
 /// Parse `users:(("node",pid=1234,fd=5))` → (1234, "node")
@@ -648,10 +624,7 @@ fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
     let mut all = parse_proc_tcp("/proc/net/tcp", &inode_to_pid, show_all);
     all.extend(parse_proc_tcp("/proc/net/tcp6", &inode_to_pid, show_all));
 
-    let mut seen = std::collections::HashSet::new();
-    all.retain(|e| seen.insert(e.port));
-    all.sort_by_key(|e| e.port);
-    all
+    merge_entries_by_port(all)
 }
 
 fn parse_proc_tcp(path: &str, inode_to_pid: &std::collections::HashMap<u64, u32>, show_all: bool) -> Vec<PortEntry> {
@@ -699,72 +672,40 @@ fn parse_proc_tcp(path: &str, inode_to_pid: &std::collections::HashMap<u64, u32>
 // ─── Tauri Commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
-    #[cfg(debug_assertions)]
-    let log_path = "/tmp/harbor.log".to_string();
-    #[cfg(debug_assertions)]
-    let write_log = |message: &str| {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "{message}");
-        }
-    };
-
-    #[cfg(debug_assertions)]
-    write_log(&format!(">>> scan_ports called with show_all={show_all}"));
+async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
+    append_log(&format!(">>> scan_ports called with show_all={show_all}"));
 
     let (tx, rx) = mpsc::channel();
-    #[cfg(debug_assertions)]
-    let log_path_for_thread = log_path.clone();
-    std::thread::spawn(move || {
-        #[cfg(debug_assertions)]
-        let write_log = |message: &str| {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path_for_thread)
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{message}");
-            }
-        };
-
+    tauri::async_runtime::spawn_blocking(move || {
         let res = if let Some(entries) = scan_with_ss(show_all) {
-            #[cfg(debug_assertions)]
-            write_log(&format!(
+            append_log(&format!(
                 ">>> scan_with_ss succeeded with {} entries",
                 entries.len()
             ));
             entries
         } else {
-            #[cfg(debug_assertions)]
-            write_log(">>> scan_with_ss failed, falling back to scan_with_proc");
+            append_log(">>> scan_with_ss failed, falling back to scan_with_proc");
             let entries = scan_with_proc(show_all);
-            #[cfg(debug_assertions)]
-            write_log(&format!(
+            append_log(&format!(
                 ">>> scan_with_proc succeeded with {} entries",
                 entries.len()
             ));
             entries
         };
 
-        #[cfg(debug_assertions)]
-        write_log(">>> scan_ports returning to JS");
+        append_log(">>> scan_ports returning to JS");
         let _ = tx.send(res);
     });
 
-    match rx.recv_timeout(Duration::from_secs(10)) {
+    tauri::async_runtime::spawn_blocking(move || match rx.recv_timeout(Duration::from_secs(10)) {
         Ok(entries) => Ok(entries),
         Err(_) => {
-            #[cfg(debug_assertions)]
-            write_log(">>> scan_ports timed out");
+            append_log(">>> scan_ports timed out");
             Err("scan timed out after 10 seconds".to_string())
         }
-    }
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -964,6 +905,68 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn parses_proc_stat_after_the_process_name() {
+        let fields = "S 4 5 6 7 8 9 10 11 12 13 140 150 16 17 18 19 20 21 220 23";
+        for name in ["node", "next-server (v16.2.7)", "worker) pool"] {
+            let stat = format!("123 ({name}) {fields}");
+            assert_eq!(parse_proc_stat(&stat), Some((140, 150, 220)));
+        }
+    }
+
+    #[test]
+    fn rejects_incomplete_proc_stat() {
+        assert_eq!(parse_proc_stat("123 missing-comm S 4 5"), None);
+        assert_eq!(parse_proc_stat("123 (node) S 4 5"), None);
+    }
+
+    #[test]
+    fn protects_zero_pid_system_processes_and_other_users() {
+        assert!(compute_is_protected(0, 1000, 1000, false));
+        assert!(compute_is_protected(42, 1000, 1000, true));
+        assert!(compute_is_protected(42, 1001, 1000, false));
+        assert!(!compute_is_protected(42, 1000, 1000, false));
+    }
+
+    #[test]
+    fn merges_ports_using_first_entry_and_unique_pids() {
+        let first = PortEntry {
+            port: 8080,
+            pid: 42,
+            pids: vec![42, 42, 43],
+            process_name: "first".to_string(),
+            cmdline: String::new(),
+            cwd: String::new(),
+            state: "listening".to_string(),
+            cpu_percent: 0.0,
+            mem_mb: 0.0,
+            uptime_seconds: 0,
+            uid: 1000,
+            is_protected: false,
+        };
+        let second = PortEntry {
+            pid: 44,
+            pids: vec![44, 43, 44],
+            process_name: "second".to_string(),
+            is_protected: true,
+            ..first.clone()
+        };
+        let other_port = PortEntry {
+            port: 3000,
+            ..first.clone()
+        };
+
+        let merged = merge_entries_by_port(vec![first, other_port, second]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].port, 3000);
+        assert_eq!(merged[0].pids, vec![42, 43]);
+        assert_eq!(merged[1].port, 8080);
+        assert_eq!(merged[1].pid, 42);
+        assert_eq!(merged[1].process_name, "first");
+        assert!(merged[1].is_protected);
+        assert_eq!(merged[1].pids, vec![42, 43, 44]);
+    }
+
     fn pid_alive(pid: u32) -> bool {
         if pid == 0 {
             return false;
@@ -1058,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live localhost ports (next on :3000, ulauncher on :5054)"]
+    #[ignore = "requires live localhost ports (same-user next on :3000, ulauncher on :5054)"]
     fn scan_marks_next_killable_and_ulauncher_protected() {
         let Some(entries) = scan_with_ss(true) else {
             return;
