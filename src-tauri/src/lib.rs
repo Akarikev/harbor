@@ -16,6 +16,7 @@ pub struct PortEntry {
     pub pid: u32,
     pub pids: Vec<u32>,
     pub process_name: String,
+    pub launched_from: String,
     pub cmdline: String,
     pub cwd: String,
     pub state: String,
@@ -289,8 +290,8 @@ fn is_pid_protected(pid: u32) -> bool {
 }
 
 fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) -> PortEntry {
-    let (pids, cmdline, cwd, uid, mem_mb, cpu_percent, uptime_seconds) = if pid == 0 {
-        (vec![], String::new(), String::new(), socket.uid, 0.0, 0.0, 0)
+    let (pids, cmdline, cwd, uid, mem_mb, cpu_percent, uptime_seconds, launched_from) = if pid == 0 {
+        (vec![], String::new(), String::new(), socket.uid, 0.0, 0.0, 0, "service".into())
     } else {
         let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
         let uid = parse_process_uid(&status).unwrap_or(socket.uid);
@@ -300,7 +301,7 @@ fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) ->
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|value| value.parse::<f32>().ok())
             .map_or(0.0, |kb| kb / 1024.0);
-        let (cpu_percent, uptime_seconds) = get_process_stats(pid, cpu_scan);
+        let (cpu_percent, uptime_seconds, launched_from) = get_process_stats(pid, cpu_scan);
         (
             vec![pid],
             get_cmdline(pid),
@@ -309,6 +310,7 @@ fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) ->
             mem_mb,
             cpu_percent,
             uptime_seconds,
+            launched_from,
         )
     };
     let process_name = resolve_display_name(pid, &cmdline);
@@ -319,6 +321,7 @@ fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) ->
         pid,
         pids,
         process_name,
+        launched_from,
         cmdline,
         cwd,
         state: "listening".to_string(),
@@ -401,17 +404,100 @@ fn num_cpus() -> f32 {
     })
 }
 
-fn parse_proc_stat(stat: &str) -> Option<(u64, u64, u64)> {
+fn split_proc_stat(stat: &str) -> Option<(&str, &str)> {
+    stat.split_once('(')?.1.rsplit_once(')')
+}
+
+fn parse_proc_stat(stat: &str) -> Option<(u32, u64, u64, u64)> {
     // Field 3 (state) follows the final ')' of field 2 (comm).
-    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
-    let utime = fields.nth(14 - 3)?.parse().ok()?;
+    let mut fields = split_proc_stat(stat)?.1.split_whitespace();
+    let parent = fields.nth(1)?.parse().ok()?;
+    let utime = fields.nth(14 - 5)?.parse().ok()?;
     let stime = fields.next()?.parse().ok()?;
     let starttime = fields.nth(22 - 16)?.parse().ok()?;
-    Some((utime, stime, starttime))
+    Some((parent, utime, stime, starttime))
+}
+
+fn resolve_launch_app(ancestors: impl IntoIterator<Item = String>) -> String {
+    let mut fallback = None;
+    for ancestor in ancestors {
+        let name = ancestor.trim();
+        let known = match name.to_ascii_lowercase().as_str() {
+            "systemd" | "init" => break,
+            "bash" | "dash" | "sh" | "zsh" | "fish" | "ksh" | "tcsh" | "csh" | "nu"
+            | "login" | "sudo" | "su" | "doas" | "env" => continue,
+            "ptyxis" | "ptyxis-agent" => "Ptyxis",
+            "gnome-terminal" | "gnome-terminal-" | "gnome-terminal-server" => "GNOME Terminal",
+            "kgx" | "gnome-console" => "GNOME Console",
+            "konsole" => "Konsole",
+            "kitty" => "Kitty",
+            "alacritty" => "Alacritty",
+            "wezterm" | "wezterm-gui" => "WezTerm",
+            "foot" | "footclient" => "Foot",
+            "ghostty" => "Ghostty",
+            "tilix" => "Tilix",
+            "terminator" => "Terminator",
+            "xterm" => "XTerm",
+            "code" | "code-insiders" | "code-oss" => "VS Code",
+            "codium" | "vscodium" => "VSCodium",
+            "cursor" => "Cursor",
+            "zed" | "zed-editor" => "Zed",
+            "idea" | "idea64" | "intellij-idea" => "IntelliJ IDEA",
+            "pycharm" => "PyCharm",
+            "webstorm" => "WebStorm",
+            "goland" => "GoLand",
+            "rustrover" => "RustRover",
+            "clion" => "CLion",
+            "phpstorm" => "PhpStorm",
+            "rubymine" => "RubyMine",
+            "datagrip" => "DataGrip",
+            "rider" => "Rider",
+            "jetbrains" => "JetBrains",
+            "tmux" | "tmux: server" | "tmux: client" => "tmux",
+            "zellij" => "Zellij",
+            "herdr" => "Herdr",
+            _ => {
+                if fallback.is_none() && !name.is_empty() {
+                    fallback = Some(name.to_owned());
+                }
+                continue;
+            }
+        };
+        return known.into();
+    }
+    fallback.unwrap_or_else(|| "service".into())
+}
+
+fn read_launch_app(mut parent: u32) -> String {
+    resolve_launch_app(std::iter::from_fn(|| {
+        if parent == 0 {
+            return None;
+        }
+        let stat = fs::read_to_string(format!("/proc/{parent}/stat")).ok()?;
+        let (comm, fields) = split_proc_stat(&stat)?;
+        let name = if matches!(comm, "java" | "javaw") {
+            let cmdline = get_cmdline(parent);
+            cmdline
+                .split_whitespace()
+                .find_map(|arg| arg.strip_prefix("-Didea.platform.prefix="))
+                .unwrap_or(comm)
+                .to_owned()
+        } else {
+            comm.to_owned()
+        };
+        parent = fields.split_whitespace().nth(1)?.parse().ok()?;
+        Some(name)
+    }).take(64))
 }
 
 type ProcessKey = (u32, u64);
-type CpuSamples = HashMap<ProcessKey, (u64, Instant)>;
+type CpuSamples = HashMap<ProcessKey, CpuSample>;
+
+struct CpuSample {
+    ticks: u64,
+    time: Instant,
+    launched_from: String,
+}
 
 struct CpuScan {
     // Keep sample updates and pruning together if another scan is already running.
@@ -452,46 +538,58 @@ fn cpu_usage_percent(delta_ticks: u64, elapsed_secs: f64, clk_tck: f64, cpus: f3
         as f32
 }
 
-fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, u64) {
-    (|| -> Option<(f32, u64)> {
-        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-        let now = Instant::now();
-        let (utime, stime, starttime) = parse_proc_stat(&stat)?;
-        let clk_tck = cpu_scan.clk_tck;
-        let seconds = (cpu_scan.uptime? - starttime as f64 / clk_tck).max(0.0);
-        let total_ticks = utime + stime;
-        let key = (pid, starttime);
-        // A process listening on multiple sockets gets one CPU reading per scan.
-        let cpu = *cpu_scan.readings.entry(key).or_insert_with(|| {
-            let previous_sample = cpu_scan.samples.insert(key, (total_ticks, now));
-            let (delta_ticks, elapsed_secs) = match previous_sample {
-                Some((previous_ticks, previous_time)) => (
-                    total_ticks.saturating_sub(previous_ticks),
-                    now.duration_since(previous_time).as_secs_f64(),
-                ),
-                None => (total_ticks, seconds),
-            };
-            cpu_usage_percent(delta_ticks, elapsed_secs, clk_tck, num_cpus())
-        });
-        Some((cpu, seconds as u64))
-    })()
-    .unwrap_or((0.0, 0))
+fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, u64, String) {
+    let Some((parent, utime, stime, starttime)) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_proc_stat(&stat))
+    else {
+        return (0.0, 0, "service".into());
+    };
+    let now = Instant::now();
+    let clk_tck = cpu_scan.clk_tck;
+    let seconds = (cpu_scan.uptime.unwrap_or(0.0) - starttime as f64 / clk_tck).max(0.0);
+    let total_ticks = utime + stime;
+    let key = (pid, starttime);
+    let mut elapsed = seconds;
+    let mut delta = total_ticks;
+    let sample = cpu_scan.samples.entry(key).and_modify(|sample| {
+        elapsed = now.duration_since(sample.time).as_secs_f64();
+        delta = total_ticks.saturating_sub(sample.ticks);
+    }).or_insert_with(|| CpuSample {
+        ticks: total_ticks,
+        time: now,
+        launched_from: read_launch_app(parent),
+    });
+    // A process listening on multiple sockets gets one CPU reading per scan.
+    let cpu = *cpu_scan.readings.entry(key).or_insert_with(|| {
+        sample.ticks = total_ticks;
+        sample.time = now;
+        cpu_usage_percent(delta, elapsed, clk_tck, num_cpus())
+    });
+    (cpu, seconds as u64, sample.launched_from.clone())
 }
 
 fn merge_entries_by_port(entries: Vec<PortEntry>) -> Vec<PortEntry> {
-    let mut by_port = BTreeMap::new();
+    use std::collections::btree_map::Entry;
+    let mut by_port: BTreeMap<u16, PortEntry> = BTreeMap::new();
     for mut entry in entries {
-        let pids = std::mem::take(&mut entry.pids);
-        let is_protected = entry.is_protected;
-        let merged = by_port.entry(entry.port).or_insert(entry);
-        merged.is_protected |= is_protected;
-        for pid in pids {
-            if !merged.pids.contains(&pid) {
-                merged.pids.push(pid);
+        match by_port.entry(entry.port) {
+            Entry::Vacant(slot) => { slot.insert(entry); }
+            Entry::Occupied(mut slot) => {
+                let merged = slot.get_mut();
+                if entry.pid != 0 && (merged.pid == 0 || entry.pid < merged.pid) {
+                    std::mem::swap(merged, &mut entry);
+                }
+                merged.pids.append(&mut entry.pids);
+                merged.is_protected |= entry.is_protected;
             }
         }
     }
-    by_port.into_values().collect()
+    by_port.into_values().map(|mut row| {
+        row.pids.sort_unstable();
+        row.pids.dedup();
+        row
+    }).collect()
 }
 
 // ─── Listening sockets and their process owners ────────────────────────────────
@@ -865,7 +963,9 @@ pub fn run() {
             scan_ports,
             kill_processes,
             open_in_browser,
-            quit_app
+            quit_app,
+            popup::resize_popup,
+            popup::popup_hold
         ])
         .build(context)
         .expect("error while building harbor")
@@ -960,8 +1060,18 @@ mod tests {
         let fields = "S 4 5 6 7 8 9 10 11 12 13 140 150 16 17 18 19 20 21 220 23";
         for name in ["node", "next-server (v16.2.7)", "worker) pool"] {
             let stat = format!("123 ({name}) {fields}");
-            assert_eq!(parse_proc_stat(&stat), Some((140, 150, 220)));
+            assert_eq!(parse_proc_stat(&stat), Some((4, 140, 150, 220)));
         }
+    }
+
+    #[test]
+    fn resolves_launchers_before_falling_back_to_the_nearest_non_shell() {
+        let resolve = |names: &[&str]| resolve_launch_app(names.iter().map(|name| (*name).to_owned()));
+        assert_eq!(resolve(&["bash", "wrapper", "tmux: server", "kitty"]), "tmux");
+        assert_eq!(resolve(&["bash", "gnome-terminal-", "systemd"]), "GNOME Terminal");
+        assert_eq!(resolve(&["zsh", "wrapper", "other", "init"]), "wrapper");
+        assert_eq!(resolve(&["sh", "systemd", "code"]), "service");
+        assert_eq!(resolve(&["fish", "RustRover"]), "RustRover");
     }
 
     #[test]
@@ -997,12 +1107,13 @@ mod tests {
     }
 
     #[test]
-    fn merges_ports_using_first_entry_and_unique_pids() {
+    fn merges_ports_using_lowest_known_pid_and_sorted_unique_pids() {
         let first = PortEntry {
             port: 8080,
             pid: 42,
             pids: vec![42, 42, 43],
             process_name: "first".to_string(),
+            launched_from: "Ptyxis".into(),
             cmdline: String::new(),
             cwd: String::new(),
             state: "listening".to_string(),
@@ -1024,7 +1135,8 @@ mod tests {
             ..first.clone()
         };
 
-        let merged = merge_entries_by_port(vec![first, other_port, second]);
+        let unknown = PortEntry { pid: 0, pids: vec![], ..first.clone() };
+        let merged = merge_entries_by_port(vec![unknown, second, other_port, first]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].port, 3000);
         assert_eq!(merged[0].pids, vec![42, 43]);

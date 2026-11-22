@@ -1,25 +1,3 @@
-// harbor — frontend logic
-// Calls Tauri Rust commands via __TAURI_INTERNALS__
-
-const THEME_LABELS = {
-  light: 'Light',
-  system: 'Follow system',
-  dark: 'Dark',
-};
-
-const REFRESH_LABELS = {
-  2000: 'Every 2 seconds',
-  5000: 'Every 5 seconds',
-  10000: 'Every 10 seconds',
-  30000: 'Every 30 seconds',
-  0: 'Off',
-};
-
-const KILL_ACTION_LABELS = {
-  soft: 'Soft (SIGTERM)',
-  force: 'Force (SIGKILL)',
-};
-
 function getTauriApi() {
   const api = window.__TAURI__;
   if (!api?.core?.invoke) {
@@ -37,41 +15,6 @@ function getCurrentAppWindow() {
   return api.webviewWindow?.getCurrentWebviewWindow?.() ?? api.window?.getCurrentWindow?.();
 }
 
-// ─── State ───────────────────────────────────────────────────────────────────
-let ports = [];
-let popupFocused = false;
-let refreshInterval = null;
-let scanInFlight = false;
-let latestScanRequest = 0;
-let currentTheme = 'system';
-let showAllPorts = false;
-let confirmBeforeKill = true;
-let defaultKillAction = 'soft';
-let expandedPort = null;
-let confirmResolver = null;
-let toastTimer = null;
-
-// ─── DOM refs ─────────────────────────────────────────────────────────────────
-const portList = document.getElementById('port-list');
-const emptyState = document.getElementById('empty-state');
-const loadingState = document.getElementById('loading-state');
-const quitBtn = document.getElementById('quit-btn');
-const settingsBtn = document.getElementById('settings-btn');
-const showAllToggle = document.getElementById('show-all-toggle');
-const showAllToggleSettings = document.getElementById('show-all-toggle-settings');
-const confirmKillToggle = document.getElementById('confirm-kill-toggle');
-const settingsPanel = document.getElementById('settings-panel');
-const settingsClose = document.getElementById('settings-close');
-const themeSelect = document.getElementById('theme-select');
-const refreshSelect = document.getElementById('refresh-select');
-const killActionSelect = document.getElementById('kill-action-select');
-const confirmPanel = document.getElementById('confirm-panel');
-const confirmMessage = document.getElementById('confirm-message');
-const confirmCancel = document.getElementById('confirm-cancel');
-const confirmAccept = document.getElementById('confirm-accept');
-const toastEl = document.getElementById('toast');
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function formatMem(mb) {
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   if (mb >= 1) return `${mb.toFixed(0)} MB`;
@@ -96,30 +39,8 @@ function formatUptime(seconds) {
   return parts.slice(0, 2).join(' ');
 }
 
-function getEnergyImpact(cpu) {
-  if (cpu < 5) return { label: 'Low', class: 'energy-low' };
-  if (cpu < 20) return { label: 'Medium', class: 'energy-medium' };
-  return { label: 'High', class: 'energy-high' };
-}
-
-function energyIconSvg() {
-  return `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>`;
-}
-
 function getDisplayName(entry) {
   return entry.process_name?.trim() || getCommandName(entry.cmdline);
-}
-
-function getPathContext(cmdline, pid) {
-  if (!cmdline) return `Unknown (PID ${pid})`;
-  const parts = cmdline.split(' ');
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const p = parts[i];
-    if (p.includes('/') || p.includes('\\')) {
-      return p.split(/[\/\\]/).pop() || p;
-    }
-  }
-  return parts[0];
 }
 
 function getCommandName(cmdline, processName) {
@@ -204,190 +125,96 @@ function getSavedKillAction() {
   return saved === 'force' ? 'force' : 'soft';
 }
 
-function syncColorScheme(theme) {
-  const root = document.documentElement;
-  if (theme === 'dark') {
-    root.style.colorScheme = 'dark';
-  } else if (theme === 'light') {
-    root.style.colorScheme = 'light';
-  } else {
-    root.style.colorScheme = window.matchMedia('(prefers-color-scheme: dark)').matches
-      ? 'dark'
-      : 'light';
-  }
-}
+const byId = (id) => document.getElementById(id);
+const viewport = byId('viewport');
+const portList = byId('port-list');
+const portsView = byId('ports-view');
+const settingsView = byId('settings-view');
+const emptyState = byId('empty-state');
+const loadingState = byId('loading-state');
+const settingsBtn = byId('settings-btn');
+const settingsBack = byId('settings-back');
+const showAllToggle = byId('show-all-toggle');
+const showAllSettings = byId('show-all-settings');
+const refreshSelect = byId('refresh-select');
+const confirmKillToggle = byId('confirm-kill-toggle');
+const killActionSelect = byId('kill-action-select');
+const themeSelect = byId('theme-select');
+const toast = byId('toast');
+const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
 
-function setCustomSelectValue(selectEl, value, labels) {
-  if (!selectEl) return;
-  selectEl.dataset.value = String(value);
-  const label = labels[value] ?? labels[String(value)] ?? String(value);
-  const valueEl = selectEl.querySelector('.custom-select-value');
-  if (valueEl) valueEl.textContent = label;
+let ports = [];
+let popupFocused = false;
+let refreshInterval = null;
+let scanInFlight = false;
+let latestScanRequest = 0;
+let expandedPort = null;
+let pendingKill = null;
+const killing = new Set();
+let toastTimer;
+let listScroll = 0;
+let resizeFrame = 0;
+let requestedHeight = 0;
 
-  for (const option of selectEl.querySelectorAll('.custom-select-option')) {
-    option.classList.toggle('selected', option.dataset.value === String(value));
-  }
-}
+const icons = {
+  launch: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m6 9 3 3-3 3m6 0h5"/>',
+  uptime: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  cpu: '<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 2v3m6-3v3M9 19v3m6-3v3M2 9h3m-3 6h3m14-6h3m-3 6h3M9 9h6v6H9z"/>',
+  memory: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M6 18v3m4-3v3m4-3v3m4-3v3M7 10v4m5-4v4m5-4v4"/>',
+  bolt: '<path d="m13 2-8 12h6l-1 8 9-12h-6z"/>',
+  open: '<path d="M13 4h7v7m0-7-9 9m-2-8H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3"/>',
+  copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+  close: '<path d="m6 6 12 12m0-12L6 18"/>',
+  chevron: '<path d="m9 5 7 7-7 7"/>',
+  lock: '<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+};
+const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true">${icons[name]}</svg>`;
 
-function closeAllCustomSelects(except = null) {
-  for (const select of document.querySelectorAll('.custom-select.open')) {
-    if (select === except) continue;
-    select.classList.remove('open');
-    select.querySelector('.custom-select-menu')?.classList.add('hidden');
-  }
-}
-
-function initCustomSelect(selectEl, labels, onChange) {
-  if (!selectEl) return;
-
-  const trigger = selectEl.querySelector('.custom-select-trigger');
-  const menu = selectEl.querySelector('.custom-select-menu');
-  if (!trigger || !menu) return;
-
-  trigger.addEventListener('click', (event) => {
-    event.stopPropagation();
-    const willOpen = !selectEl.classList.contains('open');
-    closeAllCustomSelects(selectEl);
-    selectEl.classList.toggle('open', willOpen);
-    menu.classList.toggle('hidden', !willOpen);
-  });
-
-  for (const option of selectEl.querySelectorAll('.custom-select-option')) {
-    option.addEventListener('click', (event) => {
-      event.stopPropagation();
-      const value = option.dataset.value;
-      setCustomSelectValue(selectEl, value, labels);
-      closeAllCustomSelects();
-      onChange(value);
+function sizePopup() {
+  if (resizeFrame) return;
+  resizeFrame = requestAnimationFrame(() => {
+    resizeFrame = 0;
+    const content = settingsView.hidden ? portsView : settingsView;
+    const height = Math.ceil(content.getBoundingClientRect().height
+      + byId('header').offsetHeight + byId('footer').offsetHeight
+      + window.innerHeight - byId('app').clientHeight);
+    if (height === requestedHeight) return;
+    requestedHeight = height;
+    invokeCommand('resize_popup', { height }).catch((err) => {
+      requestedHeight = 0;
+      console.error('resize_popup failed:', err);
     });
-  }
+  });
 }
 
-function applyTheme(theme) {
-  currentTheme = theme;
-  document.documentElement.setAttribute('data-theme', theme);
-  localStorage.setItem('harbor-theme', theme);
-  syncColorScheme(theme);
-  setCustomSelectValue(themeSelect, theme, THEME_LABELS);
-}
-
-function restartRefreshInterval(ms) {
-  clearInterval(refreshInterval);
-  refreshInterval = popupFocused && ms > 0 ? setInterval(refresh, ms) : null;
-}
-
-function applyRefreshInterval(ms) {
-  const parsed = Number(ms);
-  localStorage.setItem('harbor-refresh-interval', String(parsed));
-  restartRefreshInterval(parsed);
-  setCustomSelectValue(refreshSelect, parsed, REFRESH_LABELS);
-}
-
-function applyShowAll(enabled) {
-  showAllPorts = Boolean(enabled);
-  localStorage.setItem('harbor-show-all', String(showAllPorts));
-  if (showAllToggle) showAllToggle.checked = showAllPorts;
-  if (showAllToggleSettings) showAllToggleSettings.checked = showAllPorts;
-}
-
-function applyConfirmBeforeKill(enabled) {
-  confirmBeforeKill = Boolean(enabled);
-  localStorage.setItem('harbor-confirm-kill', String(confirmBeforeKill));
-  if (confirmKillToggle) confirmKillToggle.checked = confirmBeforeKill;
-}
-
-function applyKillAction(action) {
-  defaultKillAction = action === 'force' ? 'force' : 'soft';
-  localStorage.setItem('harbor-kill-action', defaultKillAction);
-  setCustomSelectValue(killActionSelect, defaultKillAction, KILL_ACTION_LABELS);
-}
-
-function openSettings() {
-  settingsPanel.classList.remove('hidden');
-  settingsPanel.setAttribute('aria-hidden', 'false');
-}
-
-function closeSettings() {
-  closeAllCustomSelects();
-  settingsPanel.classList.add('hidden');
-  settingsPanel.setAttribute('aria-hidden', 'true');
+function showSettings(open) {
+  setPendingKill(null);
+  if (open) listScroll = viewport.scrollTop;
+  portsView.hidden = open;
+  settingsView.hidden = !open;
+  settingsBtn.hidden = open;
+  settingsBack.hidden = !open;
+  byId('quick-show-all').hidden = open;
+  byId('app-title').textContent = open ? 'Settings' : 'harbor';
+  (open ? settingsBack : settingsBtn).focus({ preventScroll: true });
+  viewport.scrollTop = open ? 0 : listScroll;
+  sizePopup();
 }
 
 function showToast(message, tone = 'error') {
-  if (!toastEl) return;
-  toastEl.textContent = message;
-  toastEl.dataset.tone = tone;
-  toastEl.classList.remove('hidden');
-  if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    toastEl.classList.add('hidden');
-  }, 3200);
+  toast.textContent = message;
+  toast.dataset.tone = tone;
+  toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.hidden = true; }, 3200);
 }
 
-function showConfirm({ title, message, confirmText = 'Confirm', confirmTone = 'danger' }) {
-  confirmPanel.classList.remove('hidden');
-  confirmPanel.setAttribute('aria-hidden', 'false');
-  document.getElementById('confirm-title').textContent = title;
-  confirmMessage.textContent = message;
-  confirmAccept.textContent = confirmText;
-  confirmAccept.dataset.tone = confirmTone;
-
-  return new Promise((resolve) => {
-    confirmResolver = resolve;
-  });
+function restartRefreshInterval() {
+  clearInterval(refreshInterval);
+  const ms = Number(refreshSelect.value);
+  refreshInterval = popupFocused && ms > 0 ? setInterval(refresh, ms) : null;
 }
 
-function closeConfirm(result = false) {
-  confirmPanel.classList.add('hidden');
-  confirmPanel.setAttribute('aria-hidden', 'true');
-  if (confirmResolver) {
-    confirmResolver(result);
-    confirmResolver = null;
-  }
-}
-
-async function killEntry(entryRef, { force = false } = {}) {
-  const entry = ports.find((p) => p.port === entryRef.port) || entryRef;
-
-  if (isProtectedEntry(entry)) {
-    showToast('This process is protected and cannot be killed.');
-    return;
-  }
-
-  const killPids = getKillPids(entry);
-  if (killPids.length === 0) {
-    showToast('No process ID available to kill.');
-    return;
-  }
-
-  const useForce = force || defaultKillAction === 'force';
-  const signalLabel = useForce ? 'SIGKILL' : 'SIGTERM';
-
-  if (confirmBeforeKill) {
-    const confirmed = await showConfirm({
-      title: useForce ? 'Force kill process?' : 'Kill process?',
-      message: useForce
-        ? `Send ${signalLabel} to :${entry.port} (${entry.process_name || 'unknown'})? This stops it immediately.`
-        : `Send ${signalLabel} to :${entry.port} (${entry.process_name || 'unknown'})?`,
-      confirmText: useForce ? 'Force kill' : 'Kill',
-      confirmTone: useForce ? 'warn' : 'danger',
-    });
-    if (!confirmed) return;
-  }
-
-  try {
-    await invokeCommand('kill_processes', { port: entry.port, pids: killPids, force: useForce });
-    const row = portList.querySelector(`.port-row[data-port="${entry.port}"]`);
-    if (row) removeRow(entry.port, row);
-    refresh({ supersede: true });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error('kill_processes failed:', err);
-    showToast(message || 'Failed to kill process.');
-  }
-}
-
-// ─── Port scanning ────────────────────────────────────────────────────────────
 async function refresh({ supersede = false } = {}) {
   if (!popupFocused || (scanInFlight && !supersede)) return;
   const requestId = ++latestScanRequest;
@@ -395,434 +222,414 @@ async function refresh({ supersede = false } = {}) {
 
   scanInFlight = true;
   if (ports.length === 0) {
-    loadingState.classList.remove('hidden');
-    emptyState.classList.add('hidden');
+    loadingState.hidden = false;
+    emptyState.hidden = true;
+    sizePopup();
   }
 
   try {
-    const result = await invokeCommand('scan_ports', { showAll: showAllPorts });
+    const result = await invokeCommand('scan_ports', { showAll: showAllToggle.checked });
     if (requestId !== latestScanRequest) return;
     ports = Array.isArray(result) ? result : [];
     render();
   } catch (err) {
     if (requestId !== latestScanRequest) return;
-    console.error('scan_ports failed:', err);
-    emptyState.classList.remove('hidden');
-    document.getElementById('empty-title').textContent =
-      'Error scanning ports: ' + (err instanceof Error ? err.message : String(err));
+    const message = `Error scanning ports: ${err instanceof Error ? err.message : String(err)}`;
+    if (ports.length === 0) {
+      emptyState.textContent = message;
+      emptyState.hidden = false;
+    } else {
+      showToast(message);
+    }
   } finally {
     scanInFlight = false;
-    loadingState.classList.add('hidden');
+    loadingState.hidden = true;
+    sizePopup();
     if (requestId !== latestScanRequest) refresh();
   }
 }
 
-// ─── Render ───────────────────────────────────────────────────────────────────
-function render() {
-  loadingState.classList.add('hidden');
+function button(action, label, graphic, style = '') {
+  return `<button class="action ${style}" type="button" data-action="${action}" title="${label}" aria-label="${label}">${graphic}</button>`;
+}
 
-  if (ports.length === 0) {
-    portList.innerHTML = '';
-    emptyState.classList.remove('hidden');
-    return;
-  }
+const rowLayoutTargets = '.meta, .meta .meta-item:not(.launch-meta), .action-group';
+const rowLayoutObserver = new ResizeObserver((entries) => {
+  const rows = new Set(entries.map(({ target }) => target.closest('.port-row')));
+  for (const row of rows) {
+    const group = row.querySelector('.action-group:not([hidden])');
+    const groupWidth = group.getBoundingClientRect().width;
+    if (!groupWidth) continue;
 
-  emptyState.classList.add('hidden');
-  if (expandedPort !== null && !ports.some((port) => port.port === expandedPort)) {
-    expandedPort = null;
-  }
-
-  const existingRows = new Map(
-    [...portList.querySelectorAll('.port-row')].map((el) => [Number(el.dataset.port), el])
-  );
-
-  const newPorts = new Set(ports.map((p) => p.port));
-
-  for (const [port, el] of existingRows) {
-    if (!newPorts.has(port)) {
-      el.style.opacity = '0';
-      el.style.transition = 'opacity 0.2s';
-      setTimeout(() => el.remove(), 200);
+    const width = `${Math.ceil(groupWidth)}px`;
+    if (row.style.getPropertyValue('--actions-width') !== width) {
+      row.style.setProperty('--actions-width', width);
     }
+    const meta = row.querySelector('.meta');
+    if (meta.clientWidth) fitMeta(meta, row.classList.contains('confirming'));
   }
+});
 
-  for (let i = 0; i < ports.length; i++) {
-    const entry = ports[i];
-    const existing = existingRows.get(entry.port);
+function fitMeta(meta, confirming) {
+  const [values, energy] = meta.children;
+  const [launcher, uptime, cpu, memory] = values.children;
+  const gap = parseFloat(getComputedStyle(meta).columnGap);
+  const required = confirming ? memory : launcher.firstElementChild;
+  const available = meta.getBoundingClientRect().width - energy.getBoundingClientRect().width
+    - required.getBoundingClientRect().width - gap;
+  const optional = (confirming ? [uptime, cpu] : [uptime, memory, cpu])
+    .map((item) => [item, item.getBoundingClientRect().width + gap]);
+  let used = optional.reduce((sum, [, width]) => sum + width, 0);
+  const needsRoom = used > available;
 
-    if (existing) {
-      const wasProtected = existing.classList.contains('protected');
-      const nowProtected = isProtectedEntry(entry);
-      const pidChanged = Number(existing.dataset.pid) !== Number(entry.pid);
-
-      // Recreate when protection or PID identity changes so actions stay correct.
-      if (wasProtected !== nowProtected || pidChanged) {
-        existing.replaceWith(createRow(entry));
-        continue;
-      }
-
-      const energy = getEnergyImpact(entry.cpu_percent);
-      existing.dataset.pid = entry.pid;
-
-      for (const value of existing.querySelectorAll('.cpu-val')) {
-        value.textContent = formatCpu(entry.cpu_percent);
-      }
-      for (const value of existing.querySelectorAll('.mem-val')) {
-        value.textContent = formatMem(entry.mem_mb);
-      }
-      for (const value of existing.querySelectorAll('.uptime-val')) {
-        value.textContent = formatUptime(entry.uptime_seconds);
-      }
-
-      const energyEl = existing.querySelector('.energy-val');
-      const energyPill = existing.querySelector('.status-pill');
-      if (energyEl) {
-        energyEl.textContent = energy.label;
-      }
-      if (energyPill) {
-        energyPill.className = `status-pill ${energy.class}`;
-      }
-      const detailEnergy = existing.querySelector('.detail-energy');
-      if (detailEnergy) {
-        detailEnergy.className = `detail-value detail-energy ${energy.class}`;
-        detailEnergy.textContent = `${energy.label} impact`;
-      }
-
-      const nameEl = existing.querySelector('.process-name');
-      if (nameEl) {
-        nameEl.textContent = getDisplayName(entry);
-      }
-
-      syncRowExpansion(existing, entry.port === expandedPort);
-      portList.appendChild(existing);
-    } else {
-      const row = createRow(entry);
-      portList.appendChild(row);
-    }
+  // Keep energy and RAM in confirmation, then drop uptime before CPU.
+  for (const [item, width] of optional) {
+    const omit = used > available;
+    item.classList.toggle('meta-overflow', omit);
+    if (omit) used -= width;
+  }
+  if (confirming) {
+    memory.classList.remove('meta-overflow');
+  } else {
+    const labelGap = parseFloat(getComputedStyle(launcher).columnGap);
+    launcher.lastElementChild.classList.toggle('icon-only', needsRoom || available - used - labelGap < 12);
+    launcher.classList.toggle('meta-overflow', available < 0);
   }
 }
 
-function createRow(entry) {
-  const row = document.createElement('div');
+function createRow(port) {
+  const row = document.createElement('article');
   row.className = 'port-row';
-  row.dataset.port = entry.port;
-  row.dataset.pid = entry.pid;
-
-  const displayName = getDisplayName(entry);
-  const pathContext = getPathContext(entry.cmdline, entry.pid);
-  const commandName = getCommandName(entry.cmdline, displayName);
-  const directoryContext = getDirectoryContext(entry.cwd, entry.cmdline);
-  const energy = getEnergyImpact(entry.cpu_percent);
-  const isExpanded = expandedPort === entry.port;
-  const openable = canOpenInBrowser(entry);
-  const protectedEntry = isProtectedEntry(entry);
-
-  if (protectedEntry) {
-    row.classList.add('protected');
-  }
-
+  row.dataset.port = port;
   row.innerHTML = `
     <div class="row-top">
-      <div class="row-left">:${entry.port}</div>
+      <span class="port-number"></span>
       <div class="row-main">
-        <div class="process-name">${escapeHtml(displayName)}</div>
-        <div class="process-meta">
-          <div class="meta-item process-path" title="${escapeHtml(entry.cmdline)}">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-            <span>${escapeHtml(pathContext)}</span>
+        <span class="process-name"></span>
+        <div class="row-actions">
+          <div class="action-group standard-actions">
+            ${button('open', 'Open in browser', icon('open'), 'btn-open')}
+            ${button('copy', 'Copy port', icon('copy'), 'btn-copy')}
+            ${button('arm', 'Kill process', icon('close'), 'danger')}
+            <span class="protected-mark" role="img" title="Protected process" aria-label="Protected process">${icon('lock')}</span>
           </div>
-          <div class="meta-item" title="Uptime">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-            <span class="uptime-val">${formatUptime(entry.uptime_seconds)}</span>
-          </div>
-          <div class="meta-item" title="CPU Usage">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
-            <span class="cpu-val">${formatCpu(entry.cpu_percent)}</span>
-          </div>
-          <div class="meta-item" title="Memory">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg>
-            <span class="mem-val">${formatMem(entry.mem_mb)}</span>
+          <div class="action-group confirmation-actions" aria-label="Confirm kill" hidden>
+            ${button('kill', 'Kill (SIGTERM)', 'Kill', 'confirm')}
+            ${button('force', 'Force kill (SIGKILL)', 'Force', 'force')}
+            ${button('cancel', 'Cancel kill', icon('close'))}
           </div>
         </div>
-      </div>
-      <div class="row-right">
-        <div class="status-pill ${energy.class}" title="Energy Impact">
-          ${energyIconSvg()}
-          <span class="energy-val">${energy.label}</span>
+        <button class="icon-button expand-btn" type="button" data-action="expand" aria-controls="details-${port}">${icon('chevron')}</button>
+        <div class="meta">
+          <div class="meta-values">
+            <span class="meta-item launch-meta" title="Launched from">${icon('launch')}<span class="launch-val"></span></span>
+            <span class="meta-item" title="Uptime">${icon('uptime')}<span class="uptime-val"></span></span>
+            <span class="meta-item" title="CPU">${icon('cpu')}<span class="cpu-val"></span></span>
+            <span class="meta-item" title="Memory">${icon('memory')}<span class="mem-val"></span></span>
+          </div>
+          <span class="meta-item energy" title="Energy impact">${icon('bolt')}<span class="energy-val"></span></span>
         </div>
-        <div class="hover-actions">
-          ${openable ? `
-          <button class="hover-action btn-open" type="button" title="Open in browser" aria-label="Open in browser">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
-          </button>` : ''}
-          <button class="hover-action btn-copy" type="button" title="Copy port" aria-label="Copy port">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-          </button>
-          ${protectedEntry ? `
-          <span class="system-badge" title="System process — cannot kill">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-          </span>` : `
-          <button class="hover-action kill" type="button" title="Kill process" aria-label="Kill process">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-          </button>`}
-        </div>
-        <button class="expand-btn" type="button" aria-label="${isExpanded ? 'Collapse details' : 'Expand details'}">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
-        </button>
       </div>
     </div>
-    <div class="row-details">
-      <div class="detail-grid">
-        <div class="detail-item">
-          <span class="detail-label">PID</span>
-          <span class="detail-value">${entry.pid || '—'}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-label">Command</span>
-          <span class="detail-value" title="${escapeHtml(entry.cmdline)}">${escapeHtml(commandName)}</span>
-        </div>
-        <div class="detail-item detail-wide">
-          <span class="detail-label">Directory</span>
-          <span class="detail-value" title="${escapeHtml(directoryContext)}">${escapeHtml(directoryContext)}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-label">Port</span>
-          <span class="detail-value">:${entry.port}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-label">Uptime</span>
-          <span class="detail-value uptime-val">${formatUptime(entry.uptime_seconds)}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-label">CPU</span>
-          <span class="detail-value cpu-val">${formatCpu(entry.cpu_percent)}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-label">Memory</span>
-          <span class="detail-value mem-val">${formatMem(entry.mem_mb)}</span>
-        </div>
-        <div class="detail-item">
-          <span class="detail-label">Energy</span>
-          <span class="detail-value detail-energy ${energy.class}">${energy.label} impact</span>
-        </div>
-      </div>
-      <div class="detail-actions">
-        ${openable ? `
-        <button class="detail-action-chip btn-open" type="button" title="Open in browser" aria-label="Open in browser">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-          <span>Open</span>
-        </button>` : ''}
-        <button class="detail-action-chip btn-copy" type="button" title="Copy port" aria-label="Copy port">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-          <span>Copy</span>
-        </button>
-        ${protectedEntry ? `
-        <span class="detail-protected">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-          System process
-        </span>` : `
-        <button class="detail-action-chip kill" type="button" title="Kill process" aria-label="Kill process">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
-          <span>Kill</span>
-        </button>
-        <button class="detail-action-chip force" type="button" title="Force kill process" aria-label="Force kill process">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"></path></svg>
-          <span>Force</span>
-        </button>`}
-      </div>
-    </div>
-  `;
-
-  syncRowExpansion(row, isExpanded);
-
-  row.addEventListener('click', (event) => {
-    if (event.target.closest('button, a, input, label, textarea, select, .hover-actions, .system-badge')) {
-      return;
-    }
-    expandedPort = expandedPort === entry.port ? null : entry.port;
-    render();
-  });
-
-  row.querySelector('.expand-btn').addEventListener('click', (event) => {
-    event.stopPropagation();
-    expandedPort = expandedPort === entry.port ? null : entry.port;
-    render();
-  });
-
-  bindActionButtons(row, entry);
-
+    <div class="row-details" id="details-${port}" hidden>
+      <dl class="detail-list">
+        <dt>PID</dt><dd class="pid-val"></dd>
+        <dt>Source</dt><dd class="launch-val"></dd>
+        <dt>Command</dt><dd class="command-val"></dd>
+        <dt>Directory</dt><dd class="directory-val"></dd>
+      </dl>
+      <dl class="stats">
+        <div><dt>Port</dt><dd class="detail-port"></dd></div>
+        <div><dt>Uptime</dt><dd class="uptime-val"></dd></div>
+        <div><dt>CPU</dt><dd class="cpu-val"></dd></div>
+        <div><dt>Memory</dt><dd class="mem-val"></dd></div>
+        <div><dt>Energy</dt><dd class="energy"><span class="energy-val"></span></dd></div>
+      </dl>
+    </div>`;
+  row.querySelectorAll(rowLayoutTargets).forEach((target) => rowLayoutObserver.observe(target));
   return row;
 }
 
-function bindActionButtons(row, entry) {
-  for (const button of row.querySelectorAll('.btn-open')) {
-    button.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      if (isProtectedEntry(entry)) {
-        showToast('This process is protected and cannot be opened.');
-        return;
-      }
-      try {
-        await invokeCommand('open_in_browser', { url: `http://localhost:${entry.port}` });
-      } catch (_) {}
-    });
+function updateRow(row, entry) {
+  const energy = entry.cpu_percent < 5 ? 'Low' : entry.cpu_percent < 20 ? 'Medium' : 'High';
+  const values = {
+    'port-number': `:${entry.port}`,
+    'detail-port': `:${entry.port}`,
+    'process-name': getDisplayName(entry),
+    'launch-val': entry.launched_from || 'service',
+    'uptime-val': formatUptime(entry.uptime_seconds),
+    'cpu-val': formatCpu(entry.cpu_percent),
+    'mem-val': formatMem(entry.mem_mb),
+    'energy-val': energy,
+    'pid-val': entry.pid || '—',
+    'command-val': entry.cmdline || getCommandName(entry.cmdline, entry.process_name),
+    'directory-val': getDirectoryContext(entry.cwd, entry.cmdline),
+  };
+  for (const [name, value] of Object.entries(values)) {
+    for (const field of row.getElementsByClassName(name)) {
+      if (field.textContent !== String(value)) field.textContent = value;
+    }
+  }
+  const launcher = row.querySelector('.launch-meta');
+  const launcherTitle = `Launched from ${values['launch-val']}`;
+  if (launcher.dataset.tip !== launcherTitle) launcher.dataset.tip = launcherTitle;
+  for (const field of row.getElementsByClassName('energy')) {
+    const impact = energy.toLowerCase();
+    if (field.dataset.impact !== impact) field.dataset.impact = impact;
   }
 
-  for (const button of row.querySelectorAll('.btn-copy')) {
-    button.addEventListener('click', async (event) => {
-      event.stopPropagation();
+  const protectedEntry = isProtectedEntry(entry);
+  const arm = row.querySelector('[data-action="arm"]');
+  const busy = killing.has(entry.port);
+  setHidden(row.querySelector('.btn-open'), !canOpenInBrowser(entry));
+  setHidden(arm, protectedEntry);
+  if (arm.disabled !== busy) arm.disabled = busy;
+  setHidden(row.querySelector('.protected-mark'), !protectedEntry);
+  syncRowState(row);
+}
+
+function setHidden(element, hidden) {
+  if (element.hidden !== hidden) element.hidden = hidden;
+}
+
+function syncRowState(row) {
+  const port = Number(row.dataset.port);
+  const expanded = port === expandedPort;
+  row.classList.toggle('expanded', expanded);
+  setHidden(row.querySelector('.row-details'), !expanded);
+  const button = row.querySelector('.expand-btn');
+  if (button.getAttribute('aria-expanded') !== String(expanded)) {
+    const label = expanded ? 'Collapse details' : 'Expand details';
+    button.setAttribute('aria-expanded', expanded);
+    button.setAttribute('aria-label', label);
+    button.dataset.tip = label;
+  }
+  const confirming = pendingKill?.port === port;
+  row.classList.toggle('confirming', confirming);
+  setHidden(row.querySelector('.standard-actions'), confirming);
+  setHidden(row.querySelector('.confirmation-actions'), !confirming);
+}
+
+function findRow(port) {
+  return portList.querySelector(`.port-row[data-port="${port}"]`);
+}
+
+function setPendingKill(entry, focus = false) {
+  const previous = pendingKill;
+  pendingKill = entry && { port: entry.port, pids: getKillPids(entry) };
+  if (previous) {
+    const row = findRow(previous.port);
+    if (row) {
+      syncRowState(row);
+      if (!entry && focus) row.querySelector('[data-action="arm"]').focus({ preventScroll: true });
+    }
+  }
+  if (entry) {
+    const row = findRow(entry.port);
+    syncRowState(row);
+    row.querySelector('[data-action="kill"]').focus({ preventScroll: true });
+  }
+}
+
+function render() {
+  const portsByNumber = new Map(ports.map((entry) => [entry.port, entry]));
+  if (pendingKill) {
+    const entry = portsByNumber.get(pendingKill.port);
+    if (!entry || isProtectedEntry(entry) || getKillPids(entry).join(',') !== pendingKill.pids.join(',')) {
+      setPendingKill(null);
+    }
+  }
+  if (!portsByNumber.has(expandedPort)) expandedPort = null;
+  const rows = new Map();
+  for (const row of [...portList.children]) {
+    const port = Number(row.dataset.port);
+    if (portsByNumber.has(port)) rows.set(port, row);
+    else {
+      row.querySelectorAll(rowLayoutTargets).forEach((target) => rowLayoutObserver.unobserve(target));
+      row.remove();
+    }
+  }
+
+  let cursor = portList.firstElementChild;
+  for (const entry of ports) {
+    const row = rows.get(entry.port) || createRow(entry.port);
+    updateRow(row, entry);
+    if (row !== cursor) portList.insertBefore(row, cursor);
+    cursor = row.nextElementSibling;
+  }
+  if (ports.length === 0 && emptyState.textContent !== 'No servers running') {
+    emptyState.textContent = 'No servers running';
+  }
+  setHidden(emptyState, ports.length !== 0);
+  sizePopup();
+}
+
+async function killEntry(entry, pids, force) {
+  if (isProtectedEntry(entry) || killing.has(entry.port)) return;
+  if (pids.length === 0) {
+    showToast('No process ID available to kill.');
+    return;
+  }
+  killing.add(entry.port);
+  const arm = findRow(entry.port)?.querySelector('[data-action="arm"]');
+  if (arm) arm.disabled = true;
+  try {
+    await invokeCommand('kill_processes', { port: entry.port, pids, force });
+    const row = findRow(entry.port);
+    if (row && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      row.classList.add('leaving');
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    }
+    ports = ports.filter((item) => item.port !== entry.port);
+    render();
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : String(err));
+  } finally {
+    killing.delete(entry.port);
+    if (arm) arm.disabled = false;
+    refresh({ supersede: true });
+  }
+}
+
+portList.addEventListener('click', async (event) => {
+  const top = event.target.closest('.row-top');
+  if (!top) return;
+  const port = Number(top.closest('.port-row').dataset.port);
+  const action = event.target.closest('[data-action]')?.dataset.action || 'expand';
+  const entry = ports.find((item) => item.port === port);
+  if (!entry) return;
+
+  switch (action) {
+    case 'expand': {
+      const previous = expandedPort;
+      expandedPort = previous === port ? null : port;
+      if (previous !== null && previous !== port) syncRowState(findRow(previous));
+      syncRowState(findRow(port));
+      sizePopup();
+      break;
+    }
+    case 'open':
+      if (canOpenInBrowser(entry)) {
+        try {
+          await invokeCommand('open_in_browser', { url: `http://localhost:${port}` });
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : String(err));
+        }
+      }
+      break;
+    case 'copy':
       try {
-        await navigator.clipboard.writeText(entry.port.toString());
-        showToast(`Copied :${entry.port}`, 'success');
+        await navigator.clipboard.writeText(String(port));
+        showToast(`Copied :${port}`, 'success');
       } catch (_) {
         showToast('Failed to copy port.');
       }
-    });
+      break;
+    case 'arm':
+      if (!isProtectedEntry(entry)) {
+        if (confirmKillToggle.checked) setPendingKill(entry);
+        else await killEntry(entry, getKillPids(entry), killActionSelect.value === 'force');
+      }
+      break;
+    case 'kill':
+    case 'force':
+      if (pendingKill?.port === port) {
+        const pids = pendingKill.pids;
+        setPendingKill(null);
+        await killEntry(entry, pids, action === 'force');
+      }
+      break;
+    case 'cancel':
+      setPendingKill(null, true);
+      break;
   }
-
-  for (const button of row.querySelectorAll('.kill')) {
-    button.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      await killEntry(entry, { force: false });
-    });
-  }
-
-  for (const button of row.querySelectorAll('.force')) {
-    button.addEventListener('click', async (event) => {
-      event.stopPropagation();
-      await killEntry(entry, { force: true });
-    });
-  }
-}
-
-function syncRowExpansion(row, isExpanded) {
-  row.classList.toggle('expanded', isExpanded);
-  const details = row.querySelector('.row-details');
-  const expandButton = row.querySelector('.expand-btn');
-  if (details) {
-    details.style.display = isExpanded ? 'block' : 'none';
-  }
-  if (expandButton) {
-    expandButton.setAttribute('aria-label', isExpanded ? 'Collapse details' : 'Expand details');
-  }
-}
-
-function removeRow(port, row) {
-  row.style.opacity = '0';
-  row.style.transform = 'translateX(8px)';
-  row.style.transition = 'opacity 0.25s, transform 0.25s';
-  setTimeout(() => row.remove(), 250);
-  ports = ports.filter((p) => p.port !== port);
-  if (expandedPort === port) {
-    expandedPort = null;
-  }
-  if (ports.length === 0) emptyState.classList.remove('hidden');
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-// ─── Events ───────────────────────────────────────────────────────────────────
-showAllToggle.addEventListener('change', () => {
-  applyShowAll(showAllToggle.checked);
-  refresh({ supersede: true });
 });
 
-showAllToggleSettings.addEventListener('change', () => {
-  applyShowAll(showAllToggleSettings.checked);
-  refresh({ supersede: true });
+document.addEventListener('pointerdown', (event) => {
+  if (pendingKill && !event.target.closest('.confirmation-actions')) setPendingKill(null);
 });
 
+function setShowAll(enabled) {
+  showAllToggle.checked = showAllSettings.checked = enabled;
+  localStorage.setItem('harbor-show-all', String(enabled));
+}
+
+function applyTheme() {
+  const theme = themeSelect.value;
+  document.documentElement.dataset.theme = theme === 'system' ? (systemTheme.matches ? 'dark' : 'light') : theme;
+}
+
+for (const toggle of [showAllToggle, showAllSettings]) {
+  toggle.addEventListener('change', () => {
+    setShowAll(toggle.checked);
+    refresh({ supersede: true });
+  });
+}
+refreshSelect.addEventListener('change', () => {
+  localStorage.setItem('harbor-refresh-interval', refreshSelect.value);
+  restartRefreshInterval();
+});
 confirmKillToggle.addEventListener('change', () => {
-  applyConfirmBeforeKill(confirmKillToggle.checked);
+  localStorage.setItem('harbor-confirm-kill', String(confirmKillToggle.checked));
 });
-
-settingsBtn.addEventListener('click', () => {
-  const isOpen = !settingsPanel.classList.contains('hidden');
-  if (isOpen) {
-    closeSettings();
-  } else {
-    openSettings();
-  }
+killActionSelect.addEventListener('change', () => {
+  localStorage.setItem('harbor-kill-action', killActionSelect.value);
 });
-
-settingsClose.addEventListener('click', closeSettings);
-
-settingsPanel.addEventListener('click', (event) => {
-  if (event.target === settingsPanel || event.target === document.getElementById('settings-backdrop')) {
-    closeSettings();
-  }
+themeSelect.addEventListener('change', () => {
+  localStorage.setItem('harbor-theme', themeSelect.value);
+  applyTheme();
 });
-
-confirmCancel.addEventListener('click', () => closeConfirm(false));
-confirmAccept.addEventListener('click', () => closeConfirm(true));
-confirmPanel.addEventListener('click', (event) => {
-  if (event.target === confirmPanel || event.target === document.getElementById('confirm-backdrop')) {
-    closeConfirm(false);
-  }
+systemTheme.addEventListener('change', applyTheme);
+settingsBtn.addEventListener('click', () => showSettings(true));
+settingsBack.addEventListener('click', () => showSettings(false));
+byId('quit-btn').addEventListener('click', () => {
+  invokeCommand('quit_app').catch((err) => showToast(String(err)));
 });
-
-document.addEventListener('click', () => closeAllCustomSelects());
-
-initCustomSelect(themeSelect, THEME_LABELS, (value) => applyTheme(value));
-initCustomSelect(refreshSelect, REFRESH_LABELS, (value) => applyRefreshInterval(value));
-initCustomSelect(killActionSelect, KILL_ACTION_LABELS, (value) => applyKillAction(value));
-
-quitBtn.addEventListener('click', async () => {
-  try {
-    await invokeCommand('quit_app');
-  } catch (e) {
-    console.error(e);
-  }
-});
-
-async function hidePopup() {
-  try {
-    await getCurrentAppWindow()?.hide();
-  } catch (err) {
-    console.error('window hide failed:', err);
-  }
-}
 
 function handlePopupFocus(focused) {
   if (popupFocused === focused) return;
   popupFocused = focused;
-  restartRefreshInterval(getSavedRefreshInterval());
-
+  restartRefreshInterval();
   if (focused) {
+    requestedHeight = 0;
+    sizePopup();
     refresh({ supersede: true });
-    return;
+  } else {
+    ++latestScanRequest;
+    setPendingKill(null);
   }
-
-  ++latestScanRequest;
 }
 
+window.addEventListener('wheel', (event) => {
+  if (event.ctrlKey || event.metaKey) event.preventDefault();
+}, { passive: false, capture: true });
+for (const gesture of ['gesturestart', 'gesturechange']) {
+  window.addEventListener(gesture, (event) => event.preventDefault(), { passive: false });
+}
+window.addEventListener('dragstart', (event) => event.preventDefault());
 window.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape') return;
-  if (settingsPanel.classList.contains('hidden') && confirmPanel.classList.contains('hidden')) {
-    hidePopup();
-    return;
+  if (((event.ctrlKey || event.metaKey) && ['=', '+', '-', '_', '0'].includes(event.key))
+    || event.key === 'Backspace' || (event.altKey && event.key === 'ArrowLeft')) {
+    event.preventDefault();
+  } else if (event.key === 'Escape') {
+    if (pendingKill) setPendingKill(null, true);
+    else if (!settingsView.hidden) showSettings(false);
+    else getCurrentAppWindow().hide().catch((err) => console.error('window hide failed:', err));
   }
-  closeSettings();
-  closeConfirm(false);
 });
 
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  if (currentTheme === 'system') syncColorScheme('system');
-});
-
-// ─── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
-  applyTheme(getSavedTheme());
-  applyRefreshInterval(getSavedRefreshInterval());
-  applyShowAll(getSavedShowAll());
-  applyConfirmBeforeKill(getSavedConfirmBeforeKill());
-  applyKillAction(getSavedKillAction());
+  themeSelect.value = getSavedTheme();
+  refreshSelect.value = String(getSavedRefreshInterval());
+  confirmKillToggle.checked = getSavedConfirmBeforeKill();
+  killActionSelect.value = getSavedKillAction();
+  setShowAll(getSavedShowAll());
+  applyTheme();
+  const resizeObserver = new ResizeObserver(sizePopup);
+  resizeObserver.observe(portsView);
+  resizeObserver.observe(settingsView);
+  sizePopup();
+
   const appWindow = getCurrentAppWindow();
   let focusEventCount = 0;
   await appWindow.onFocusChanged(({ payload }) => {
@@ -835,3 +642,67 @@ async function init() {
 }
 
 init().catch((err) => console.error('window initialization failed:', err));
+
+// ─── Tooltips ────────────────────────────────────────────────────────────────
+// Native title tooltips are drawn by GTK with a boxed background we can't style,
+// so titles are moved into a plain-text tip we position ourselves.
+const tip = document.createElement('div');
+tip.className = 'tip';
+tip.setAttribute('role', 'tooltip');
+tip.hidden = true;
+document.body.append(tip);
+let tipTarget = null;
+let tipTimer = 0;
+
+function hideTip() {
+  clearTimeout(tipTimer);
+  tipTarget = null;
+  tip.hidden = true;
+}
+
+let pointer = { x: 0, y: 0 };
+document.addEventListener('mousemove', (event) => { pointer = { x: event.clientX, y: event.clientY }; });
+
+document.addEventListener('mouseover', (event) => {
+  pointer = { x: event.clientX, y: event.clientY };
+  const target = event.target.closest('[title], [data-tip]');
+  if (target === tipTarget) return;
+  hideTip();
+  if (!target) return;
+  if (target.hasAttribute('title')) {
+    target.dataset.tip = target.title;
+    target.removeAttribute('title');
+  }
+  if (!target.dataset.tip) return;
+  tipTarget = target;
+  tipTimer = setTimeout(() => {
+    tip.textContent = target.dataset.tip;
+    tip.hidden = false;
+    // Sit clear of the cursor graphic (~20 px tall below the hotspot).
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = Math.min(Math.max(4, pointer.x - width / 2), window.innerWidth - width - 4);
+    const below = pointer.y + 24 + height < window.innerHeight;
+    tip.style.left = `${left}px`;
+    tip.style.top = `${below ? pointer.y + 24 : pointer.y - height - 10}px`;
+  }, 450);
+});
+document.addEventListener('mousedown', hideTip);
+document.addEventListener('scroll', hideTip, true);
+window.addEventListener('blur', hideTip);
+
+// Native <select> menus open as separate GTK popups and take focus; keep the popup
+// open meanwhile, and hide it afterwards if the user clicked outside harbor.
+for (const select of document.querySelectorAll('select')) {
+  const hold = () => invokeCommand('popup_hold', { hold: true }).catch(() => {});
+  const release = () => setTimeout(() => {
+    invokeCommand('popup_hold', { hold: false }).catch(() => {});
+    if (!document.hasFocus()) getCurrentAppWindow().hide().catch(() => {});
+  }, 150);
+  select.addEventListener('mousedown', hold);
+  select.addEventListener('keydown', (event) => {
+    if ([' ', 'Enter', 'ArrowDown', 'ArrowUp'].includes(event.key)) hold();
+  });
+  select.addEventListener('change', release);
+  select.addEventListener('blur', release);
+}

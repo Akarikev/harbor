@@ -1,11 +1,12 @@
-use gtk::{gdk, glib, prelude::*};
+use gtk::{gdk, gio, glib, pango, prelude::*};
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::{
+    sync::atomic::{AtomicBool, Ordering},
     env,
     sync::Mutex,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalRect, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, PhysicalRect, WebviewWindow, WebviewWindowBuilder};
 
 use crate::append_log;
 
@@ -75,6 +76,64 @@ pub(super) fn setup(app: &AppHandle, mode: PlacementMode) {
         lifecycle: Mutex::default(),
     });
     append_log(&format!(">>> placement mode: {}", mode.name()));
+    if let Some(settings) = gtk::Settings::default() {
+        let app = app.clone();
+        settings.connect_gtk_font_name_notify(move |_| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.eval(font_script());
+            }
+        });
+    }
+}
+
+fn font_script() -> String {
+    fn css_family(name: Option<glib::GString>, fallback: &str) -> String {
+        let family = name
+            .and_then(|name| pango::FontDescription::from_string(&name).family())
+            .filter(|family| !family.is_empty());
+        family.map_or_else(|| fallback.to_owned(), |family| {
+            let family = family.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{family}\", {fallback}")
+        })
+    }
+
+    let interface = "org.gnome.desktop.interface";
+    let mono = gio::SettingsSchemaSource::default()
+        .and_then(|source| source.lookup(interface, true))
+        .filter(|schema| schema.has_key("monospace-font-name"))
+        .map(|_| gio::Settings::new(interface).string("monospace-font-name"));
+    let ui = gtk::Settings::default().and_then(|settings| settings.gtk_font_name());
+    let ui = serde_json::to_string(&css_family(ui, "system-ui, sans-serif")).unwrap();
+    let mono = serde_json::to_string(&css_family(mono, "monospace")).unwrap();
+    format!(r#"(() => {{
+        const applyFonts = () => {{
+            document.documentElement.style.setProperty('--font-ui', {ui});
+            document.documentElement.style.setProperty('--font-mono', {mono});
+        }};
+        if (document.documentElement) applyFonts();
+        else document.addEventListener('DOMContentLoaded', applyFonts, {{ once: true }});
+    }})()"#)
+}
+
+#[tauri::command]
+pub(super) fn resize_popup(window: WebviewWindow, height: u32) -> Result<(), String> {
+    let gtk_window = window.gtk_window().map_err(|err| err.to_string())?;
+    let display = gtk_window.display();
+    let monitor = gtk_window
+        .window()
+        .and_then(|native| display.monitor_at_window(&native))
+        .or_else(|| display.primary_monitor());
+    let limit = monitor.map_or(560, |monitor| {
+        let work_height = monitor.workarea().height().max(1) as u32;
+        (work_height * 7 / 10).clamp(1, 560)
+    });
+    let height = height.clamp(1, limit);
+    if gtk_window.size().1 != height as i32 {
+        window
+            .set_size(LogicalSize::new(POPUP_WIDTH as u32, height))
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 impl PopupLifecycle {
@@ -105,7 +164,9 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
         .iter()
         .find(|config| config.label == "main")
         .ok_or(tauri::Error::WindowNotFound)?;
-    let window = WebviewWindowBuilder::from_config(app, config)?.build()?;
+    let window = WebviewWindowBuilder::from_config(app, config)?
+        .initialization_script(font_script())
+        .build()?;
     let gtk_window = window.gtk_window()?;
     if mode == PlacementMode::LayerShell && !gtk_window.is_realized() {
         gtk_window.init_layer_shell();
@@ -123,6 +184,25 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
     gtk_window.connect_map(|window| window.present());
     let handle = app.clone();
     gtk_window.connect_unmap(move |_| schedule_idle_destruction(&handle));
+    window.with_webview(|platform| {
+        let view = platform.inner();
+        view.set_property("zoom-level", 1.0_f64);
+        #[cfg(not(debug_assertions))]
+        view.connect_local("context-menu", false, |_| Some(true.to_value()));
+        // Consume pinch before the WebView's native gesture handler can scale the page.
+        view.connect_event(|_, event| {
+            if event.event_type() == gdk::EventType::TouchpadPinch {
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        view.connect_notify_local(Some("zoom-level"), |view, _| {
+            if view.property::<f64>("zoom-level") != 1.0 {
+                view.set_property("zoom-level", 1.0_f64);
+            }
+        });
+    })?;
     log_lifecycle(&format!(
         ">>> webview recreated in {} ms",
         start.elapsed().as_millis()
@@ -180,6 +260,14 @@ pub(super) fn on_destroyed(app: &AppHandle) {
     }
 }
 
+static HOLD_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Keep the popup open while one of its native menus (e.g. a <select>) has focus.
+#[tauri::command]
+pub(super) fn popup_hold(hold: bool) {
+    HOLD_OPEN.store(hold, Ordering::Relaxed);
+}
+
 pub(super) fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if window.label() != "main" {
         return;
@@ -189,6 +277,11 @@ pub(super) fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent
     };
     append_log(&format!(">>> popup focus={focused}"));
     if *focused {
+        HOLD_OPEN.store(false, Ordering::Relaxed);
+        return;
+    }
+    // A native <select> menu is a separate GTK popup; opening it steals focus from the popup.
+    if HOLD_OPEN.load(Ordering::Relaxed) {
         return;
     }
     if let Some(placement) = window.try_state::<PopupPlacement>() {
