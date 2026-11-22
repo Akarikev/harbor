@@ -74,7 +74,8 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 
 #app {
   position: absolute;
-  inset: var(--inset);
+  /* Width trial: 19 px side margins -> 362 px card (was 386) inside the 400 px window. */
+  inset: var(--inset) 19px;
   overflow: hidden;
   border: 1px solid var(--edge);
   border-radius: 13px;
@@ -200,7 +201,7 @@ svg {
   grid-area: 2 / 1 / 3 / 3;
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   color: var(--muted);
   font-size: 11px;
   white-space: nowrap;
@@ -217,10 +218,10 @@ svg {
 .meta-item:not(.launch-meta) { flex: none; }
 /* Exact column widths (not min-widths) so the energy status starts at the same x on every row. */
 .meta-values > .meta-item { flex: none; overflow: hidden; }
-.meta-values > .launch-meta { flex: none; width: 46px; }
-.meta-values > .meta-item:nth-child(2) { width: 52px; }
-.meta-values > .meta-item:nth-child(3) { width: 34px; }
-.meta-values > .meta-item:nth-child(4) { width: 56px; }
+.meta-values > .launch-meta { flex: none; width: 40px; }
+.meta-values > .meta-item:nth-child(2) { width: 56px; }
+.meta-values > .meta-item:nth-child(3) { width: 32px; }
+.meta-values > .meta-item:nth-child(4) { width: 52px; }
 /* Keep omitted items measurable so they can return as the row widens. */
 .meta-overflow { position: absolute; width: max-content; visibility: hidden; }
 .launch-meta .icon-only { display: none; }

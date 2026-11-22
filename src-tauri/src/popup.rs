@@ -6,12 +6,14 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, PhysicalRect, WebviewWindow, WebviewWindowBuilder};
+use webkit2gtk::{LoadEvent, SnapshotOptions, SnapshotRegion, WebViewExt};
 
 use crate::append_log;
 
 const POPUP_WIDTH: f64 = 400.0;
 const MARGIN: i32 = 12;
 const WEBVIEW_IDLE: Duration = Duration::from_secs(60);
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlacementMode {
@@ -30,6 +32,7 @@ struct PopupLifecycle {
     last_focus_loss: Option<Instant>,
     idle_timer: Option<glib::SourceId>,
     destroying: bool,
+    ready: bool,
     pending_show: Option<PopupRequest>,
 }
 
@@ -179,12 +182,38 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
         gtk_window.set_position(gtk::WindowPosition::Center);
     }
 
-    // Tao queues show(), so present once GTK has mapped the window.
+    // Present once GTK has mapped the window.
     gtk_window.connect_map(|window| window.present());
     let handle = app.clone();
     gtk_window.connect_unmap(move |_| schedule_idle_destruction(&handle));
-    window.with_webview(|platform| {
+    let handle = app.clone();
+    window.with_webview(move |platform| {
         let view = platform.inner();
+        view.connect_load_changed(move |view, event| {
+            if event != LoadEvent::Finished || handle.state::<PopupPlacement>().lifecycle().ready {
+                return;
+            }
+            let app = handle.clone();
+            let view_ref = view.downgrade();
+            // An unmapped WebView does not get compositor frames. Render the
+            // styled document offscreen before letting GTK map the toplevel.
+            view.snapshot(
+                SnapshotRegion::FullDocument,
+                SnapshotOptions::NONE,
+                gio::Cancellable::NONE,
+                move |result| {
+                    if let Err(error) = result {
+                        append_log(&format!(">>> initial webview snapshot failed: {error}"));
+                    } else if let Some(window) = view_ref
+                        .upgrade()
+                        .and_then(|view| view.toplevel())
+                        .and_downcast::<gtk::ApplicationWindow>()
+                    {
+                        first_frame_ready(&app, &window);
+                    }
+                },
+            );
+        });
         view.set_property("zoom-level", 1.0_f64);
         #[cfg(not(debug_assertions))]
         view.connect_local("context-menu", false, |_| Some(true.to_value()));
@@ -202,11 +231,41 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
             }
         });
     })?;
+    let native = gtk_window.downgrade();
+    let handle = app.clone();
+    glib::timeout_add_local_once(FIRST_FRAME_TIMEOUT.saturating_sub(start.elapsed()), move || {
+        if let Some(window) = native.upgrade() {
+            first_frame_ready(&handle, &window);
+        }
+    });
     log_lifecycle(&format!(
         ">>> webview recreated in {} ms",
         start.elapsed().as_millis()
     ));
     Ok(window)
+}
+
+fn first_frame_ready(app: &AppHandle, window: &gtk::ApplicationWindow) {
+    let current = app
+        .get_webview_window("main")
+        .and_then(|window| window.gtk_window().ok());
+    if current.as_ref() != Some(window) {
+        return;
+    }
+    let state = app.state::<PopupPlacement>();
+    let request = {
+        let mut lifecycle = state.lifecycle();
+        if lifecycle.ready || lifecycle.destroying {
+            return;
+        }
+        lifecycle.ready = true;
+        lifecycle.pending_show.take()
+    };
+    if let Some(request) = request {
+        if let Err(error) = show(app, request) {
+            append_log(&format!(">>> popup request failed: {error}"));
+        }
+    }
 }
 
 fn schedule_idle_destruction(app: &AppHandle) {
@@ -235,6 +294,7 @@ pub(super) fn on_destroyed(app: &AppHandle) {
     let (destroyed_after_idle, pending) = {
         let mut lifecycle = state.lifecycle();
         lifecycle.cancel_idle();
+        lifecycle.ready = false;
         (std::mem::take(&mut lifecycle.destroying), lifecycle.pending_show.take())
     };
     if destroyed_after_idle {
@@ -270,11 +330,12 @@ pub(super) fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent
     if *focused {
         return;
     }
-    if let Some(placement) = window.try_state::<PopupPlacement>() {
-        placement.lifecycle().last_focus_loss = Some(Instant::now());
-    }
-    if let Err(error) = window.hide() {
-        append_log(&format!(">>> popup hide on focus loss failed: {error}"));
+    if let Ok(gtk_window) = window.gtk_window() {
+        // A focus-out queued by an explicit Hide may arrive after a new Show.
+        if gtk_window.is_visible() && !gtk_window.is_active() {
+            window.state::<PopupPlacement>().lifecycle().last_focus_loss = Some(Instant::now());
+            gtk_window.hide();
+        }
     }
 }
 
@@ -287,6 +348,25 @@ pub(super) fn request(app: &AppHandle, activation: Option<(i32, i32)>, token: Op
         }
     }) {
         append_log(&format!(">>> popup dispatch failed: {error}"));
+    }
+}
+
+pub(super) fn request_hide(app: &AppHandle) {
+    let handle = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || hide(&handle)) {
+        append_log(&format!(">>> popup hide dispatch failed: {error}"));
+    }
+}
+
+fn hide(app: &AppHandle) {
+    app.state::<PopupPlacement>().lifecycle().pending_show = None;
+    if let Some(window) = app
+        .get_webview_window("main")
+        .and_then(|window| window.gtk_window().ok())
+    {
+        window.hide();
+        // A Show canceled before the first paint never emits unmap.
+        schedule_idle_destruction(app);
     }
 }
 
@@ -303,8 +383,9 @@ fn show(app: &AppHandle, request: PopupRequest) -> tauri::Result<()> {
     let window = app.get_webview_window("main");
     let visible = window.as_ref().map(|window| window.is_visible()).transpose()?.unwrap_or(false);
     if request.activation.is_some() {
-        if visible {
-            return window.expect("visible popup").hide();
+        if visible || placement.lifecycle().pending_show.is_some() {
+            hide(app);
+            return Ok(());
         }
         if recently_lost_focus(placement.lifecycle().last_focus_loss, Instant::now()) {
             return Ok(());
@@ -315,6 +396,10 @@ fn show(app: &AppHandle, request: PopupRequest) -> tauri::Result<()> {
         Some(window) => window,
         None => create_window(app, placement.mode)?,
     };
+    if !placement.lifecycle().ready {
+        placement.lifecycle().pending_show = Some(request);
+        return Ok(());
+    }
     let gtk_window = window.gtk_window()?;
 
     if !visible {
@@ -338,10 +423,13 @@ fn show(app: &AppHandle, request: PopupRequest) -> tauri::Result<()> {
     }
     if visible {
         gtk_window.present();
-        Ok(())
+    } else if placement.mode != PlacementMode::Center {
+        // Keep Tao's mapping order, including queued X11 positioning.
+        return window.show();
     } else {
-        window.show()
+        gtk_window.show_all();
     }
+    Ok(())
 }
 
 fn recently_lost_focus(last: Option<Instant>, now: Instant) -> bool {

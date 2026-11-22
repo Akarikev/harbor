@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
 };
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use zbus::{connection, fdo, interface};
 
 use crate::{append_log, popup, start_tray, stop_tray};
@@ -30,7 +30,7 @@ struct HarborService {
     app: AppHandle,
 }
 
-#[interface(name = "io.harbor.Harbor")]
+#[interface(name = "io.harbor.Harbor", spawn = false)]
 impl HarborService {
     /// The extension's button: show the popup, or close it if open.
     fn toggle(&self) {
@@ -38,10 +38,12 @@ impl HarborService {
         popup::request(&self.app, Some((0, 0)), None);
     }
 
+    fn show(&self) {
+        popup::request(&self.app, None, None);
+    }
+
     fn hide(&self) {
-        if let Some(window) = self.app.get_webview_window("main") {
-            let _ = window.hide();
-        }
+        popup::request_hide(&self.app);
     }
 }
 
