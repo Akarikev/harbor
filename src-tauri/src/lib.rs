@@ -5,7 +5,7 @@ use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::TrayIconBuilder,
     AppHandle, Manager,
 };
 
@@ -769,19 +769,36 @@ async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
     .map_err(|err| err.to_string())?
 }
 
+fn matching_pids(mut requested: Vec<u32>, listening: &[u32]) -> Vec<u32> {
+    requested.retain(|pid| *pid > 0 && listening.contains(pid));
+    requested
+}
+
 #[tauri::command]
-fn kill_processes(pids: Vec<u32>, force: bool) -> Result<(), String> {
+async fn kill_processes(port: u16, pids: Vec<u32>, force: bool) -> Result<(), String> {
     let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
     append_log(&format!(
-        ">>> kill_processes called with signal={} pids={:?}",
-        signal, pids
+        ">>> kill_processes called with port={port} signal={signal} pids={pids:?}"
     ));
 
-    let killable: Vec<u32> = pids.into_iter().filter(|pid| *pid > 0).collect();
+    let entries = scan_ports(true).await?;
+    let listening = entries
+        .iter()
+        .find(|entry| entry.port == port)
+        .map_or(&[][..], |entry| entry.pids.as_slice());
+    let killable = matching_pids(pids, listening);
     if killable.is_empty() {
-        return Err("No valid process IDs to kill".to_string());
+        return Err(format!(
+            "Process on :{port} changed or exited; refresh and try again"
+        ));
     }
 
+    tauri::async_runtime::spawn_blocking(move || signal_processes(killable, signal))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn signal_processes(killable: Vec<u32>, signal: i32) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for pid in killable {
@@ -816,16 +833,6 @@ fn kill_processes(pids: Vec<u32>, force: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn kill_process(pid: u32) -> Result<(), String> {
-    kill_processes(vec![pid], false)
-}
-
-#[tauri::command]
-fn force_kill_process(pid: u32) -> Result<(), String> {
-    kill_processes(vec![pid], true)
-}
-
-#[tauri::command]
 fn open_in_browser(url: String) -> Result<(), String> {
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
@@ -853,27 +860,14 @@ pub fn run() {
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "quit" => app.exit(0),
                     "show" => toggle_window(app),
                     _ => {}
                 })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        position,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        show_or_hide_near_tray(app, position.x, position.y);
-                    }
-                })
                 .build(app)?;
 
-            // Start hidden — only show on tray click
+            // Start hidden until opened from the tray menu.
             if let Some(win) = app.get_webview_window("main") {
                 win.hide().ok();
             }
@@ -883,8 +877,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             scan_ports,
             kill_processes,
-            kill_process,
-            force_kill_process,
             open_in_browser,
             quit_app
         ])
@@ -903,60 +895,6 @@ fn toggle_window(app: &AppHandle) {
             win.set_focus().ok();
         }
     }
-}
-
-fn show_or_hide_near_tray(app: &AppHandle, tray_x: f64, tray_y: f64) {
-    let Some(win) = app.get_webview_window("main") else { return };
-
-    if win.is_visible().unwrap_or(false) {
-        win.hide().ok();
-        return;
-    }
-
-    let win_w = 400.0f64;
-    let win_h = 520.0f64;
-    let margin = 12.0f64;
-
-    // Get screen dimensions to anchor to the correct edge
-    let (x, y) = win
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| {
-            let screen_w = monitor.size().width as f64;
-            let screen_h = monitor.size().height as f64;
-            let mon_x = monitor.position().x as f64;
-            let mon_y = monitor.position().y as f64;
-
-            // Horizontal: clamp so window stays on screen, biased to right edge
-            let raw_x = tray_x - win_w / 2.0;
-            let x = raw_x
-                .max(mon_x + margin)
-                .min(mon_x + screen_w - win_w - margin);
-
-            // Vertical: if tray is in bottom half → show above; top half → show below
-            let y = if tray_y > mon_y + screen_h / 2.0 {
-                // bottom tray (e.g. GNOME bottom panel)
-                tray_y - win_h - margin
-            } else {
-                // top tray (e.g. GNOME top bar)
-                tray_y + margin
-            };
-            let y = y.max(mon_y + margin).min(mon_y + screen_h - win_h - margin);
-
-            (x, y)
-        })
-        .unwrap_or_else(|| {
-            // Fallback if monitor info unavailable
-            let x = (tray_x - win_w / 2.0).max(0.0);
-            let y = (tray_y - win_h - margin).max(0.0);
-            (x, y)
-        });
-
-    win.set_position(tauri::PhysicalPosition::new(x as i32, y as i32))
-        .ok();
-    win.show().ok();
-    win.set_focus().ok();
 }
 
 #[cfg(test)]
@@ -996,6 +934,15 @@ mod tests {
         assert!(compute_is_protected(42, 1000, 1000, true));
         assert!(compute_is_protected(42, 1001, 1000, false));
         assert!(!compute_is_protected(42, 1000, 1000, false));
+    }
+
+    #[test]
+    fn keeps_only_requested_pids_still_listening_on_the_port() {
+        let listening = [42, 43];
+        assert_eq!(matching_pids(vec![43, 42], &listening), vec![43, 42]);
+        assert_eq!(matching_pids(vec![0, 99, 42], &listening), vec![42]);
+        assert!(matching_pids(vec![99], &listening).is_empty());
+        assert!(matching_pids(vec![42], &[]).is_empty());
     }
 
     #[test]
@@ -1073,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_processes_terminates_a_simple_process() {
+    fn signal_processes_terminates_a_simple_process() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 30")
@@ -1085,14 +1032,14 @@ mod tests {
         let pid = child.id();
         assert!(pid_alive(pid));
 
-        kill_processes(vec![pid], true).expect("kill process");
+        signal_processes(vec![pid], libc::SIGKILL).expect("kill process");
         wait_until_dead(pid, Duration::from_secs(3));
 
         let _ = child.wait();
     }
 
     #[test]
-    fn kill_processes_terminates_a_process_tree() {
+    fn signal_processes_terminates_a_process_tree() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 30 & wait")
@@ -1123,7 +1070,7 @@ mod tests {
         assert!(pid_alive(pid));
         assert!(pid_alive(spawned_child));
 
-        kill_processes(vec![pid], true).expect("kill process tree");
+        signal_processes(vec![pid], libc::SIGKILL).expect("kill process tree");
         wait_until_dead(pid, Duration::from_secs(3));
         wait_until_dead(spawned_child, Duration::from_secs(3));
 

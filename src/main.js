@@ -406,7 +406,7 @@ async function killEntry(entryRef, { force = false } = {}) {
   }
 
   try {
-    await invokeCommand('kill_processes', { pids: killPids, force: useForce });
+    await invokeCommand('kill_processes', { port: entry.port, pids: killPids, force: useForce });
     const row = portList.querySelector(`.port-row[data-port="${entry.port}"]`);
     if (row) removeRow(entry.port, row);
     refresh({ supersede: true });
