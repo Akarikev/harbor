@@ -22,7 +22,7 @@
   --text-secondary: rgba(0, 0, 0, 0.55);
   --text-tertiary: rgba(0, 0, 0, 0.4);
 
-  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-sans: system-ui, sans-serif;
   --font-mono: 'SF Mono', 'Menlo', 'Monaco', monospace;
 
   --radius-sm: 6px;

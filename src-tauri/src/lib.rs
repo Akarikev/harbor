@@ -1,6 +1,6 @@
 use ksni::TrayMethods;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -173,57 +173,19 @@ fn cmdline_display_name(cmdline: &str) -> Option<String> {
 }
 
 /// Prefer a human-meaningful name over Chromium/Node thread labels like "MainThread".
-fn resolve_display_name(pid: u32, ss_name: &str, cmdline: &str) -> String {
-    let ss_trimmed = ss_name.trim();
-    if ss_trimmed.to_lowercase().starts_with("next-server") {
-        return "next".to_string();
+fn resolve_display_name(pid: u32, cmdline: &str) -> String {
+    if let Some(name) = cmdline_display_name(cmdline) {
+        return name;
     }
 
-    let candidates = [
-        cmdline_display_name(cmdline),
-        {
-            if !ss_trimmed.is_empty() && !is_generic_thread_name(ss_trimmed) {
-                Some(ss_trimmed.to_string())
-            } else {
-                None
-            }
-        },
-        {
-            let comm = if pid > 0 {
-                get_process_name(pid)
-            } else {
-                String::new()
-            };
-            if comm.to_lowercase().starts_with("next-server") {
-                Some("next".to_string())
-            } else if !comm.is_empty() && !is_generic_thread_name(&comm) {
-                Some(comm)
-            } else {
-                None
-            }
-        },
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if !candidate.is_empty() {
-            return candidate;
-        }
-    }
-
-    if !ss_trimmed.is_empty() {
-        return ss_trimmed.to_string();
-    }
-
-    let comm = if pid > 0 {
-        get_process_name(pid)
+    let comm = if pid > 0 { get_process_name(pid) } else { String::new() };
+    if comm.to_lowercase().starts_with("next-server") {
+        "next".to_string()
+    } else if comm.is_empty() {
+        "unknown".to_string()
     } else {
-        String::new()
-    };
-    if !comm.is_empty() {
-        return comm;
+        comm
     }
-
-    "unknown".to_string()
 }
 
 fn get_cmdline(pid: u32) -> String {
@@ -258,17 +220,12 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn get_process_uid(pid: u32) -> Option<u32> {
-    if pid == 0 {
-        return None;
-    }
-
-    fs::read_to_string(format!("/proc/{}/status", pid))
-        .ok()?
+fn parse_process_uid(status: &str) -> Option<u32> {
+    status
         .lines()
         .find(|line| line.starts_with("Uid:"))
         .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u32>().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 fn is_known_system_process(name: &str, cmdline: &str, exe: &str) -> bool {
@@ -324,28 +281,41 @@ fn is_process_protected(pid: u32, uid: u32, name: &str, cmdline: &str) -> bool {
 }
 
 fn is_pid_protected(pid: u32) -> bool {
-    let uid = get_process_uid(pid).unwrap_or_else(current_euid);
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let uid = parse_process_uid(&status).unwrap_or_else(current_euid);
     let cmdline = get_cmdline(pid);
-    let name = resolve_display_name(pid, "", &cmdline);
+    let name = resolve_display_name(pid, &cmdline);
     is_process_protected(pid, uid, &name, &cmdline)
 }
 
-fn make_port_entry(
-    port: u16,
-    pid: u32,
-    pids: Vec<u32>,
-    process_name: String,
-    cmdline: String,
-    cwd: String,
-    cpu_percent: f32,
-    mem_mb: f32,
-    uptime_seconds: u64,
-) -> PortEntry {
-    let uid = get_process_uid(pid).unwrap_or_else(current_euid);
+fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) -> PortEntry {
+    let (pids, cmdline, cwd, uid, mem_mb, cpu_percent, uptime_seconds) = if pid == 0 {
+        (vec![], String::new(), String::new(), socket.uid, 0.0, 0.0, 0)
+    } else {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let uid = parse_process_uid(&status).unwrap_or(socket.uid);
+        let mem_mb = status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<f32>().ok())
+            .map_or(0.0, |kb| kb / 1024.0);
+        let (cpu_percent, uptime_seconds) = get_process_stats(pid, cpu_scan);
+        (
+            vec![pid],
+            get_cmdline(pid),
+            get_process_cwd(pid),
+            uid,
+            mem_mb,
+            cpu_percent,
+            uptime_seconds,
+        )
+    };
+    let process_name = resolve_display_name(pid, &cmdline);
     let is_protected = is_process_protected(pid, uid, &process_name, &cmdline);
 
     PortEntry {
-        port,
+        port: socket.port,
         pid,
         pids,
         process_name,
@@ -447,17 +417,25 @@ struct CpuScan {
     // Keep sample updates and pruning together if another scan is already running.
     samples: MutexGuard<'static, CpuSamples>,
     readings: HashMap<ProcessKey, f32>,
+    uptime: Option<f64>,
+    clk_tck: f64,
 }
 
 impl CpuScan {
     fn new() -> Self {
         static CPU_SAMPLES: OnceLock<Mutex<CpuSamples>> = OnceLock::new();
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let uptime = fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| text.split_whitespace().next()?.parse().ok());
         Self {
             samples: CPU_SAMPLES
                 .get_or_init(Mutex::default)
                 .lock()
                 .unwrap_or_else(|err| err.into_inner()),
             readings: HashMap::new(),
+            uptime,
+            clk_tck: if clk_tck > 0 { clk_tck as f64 } else { 100.0 },
         }
     }
 
@@ -474,25 +452,13 @@ fn cpu_usage_percent(delta_ticks: u64, elapsed_secs: f64, clk_tck: f64, cpus: f3
         as f32
 }
 
-fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, f32, u64) {
-    let mem_mb = fs::read_to_string(format!("/proc/{}/status", pid))
-        .unwrap_or_default()
-        .lines()
-        .find(|l| l.starts_with("VmRSS:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse::<f32>().ok())
-        .map(|kb| kb / 1024.0)
-        .unwrap_or(0.0);
-
-    let (cpu_percent, uptime_secs) = (|| -> Option<(f32, u64)> {
+fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, u64) {
+    (|| -> Option<(f32, u64)> {
         let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
         let now = Instant::now();
         let (utime, stime, starttime) = parse_proc_stat(&stat)?;
-        let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
-        let uptime: f64 = uptime_str.split_whitespace().next()?.parse().ok()?;
-        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        let clk_tck = if clk_tck > 0 { clk_tck as f64 } else { 100.0 };
-        let seconds = (uptime - starttime as f64 / clk_tck).max(0.0);
+        let clk_tck = cpu_scan.clk_tck;
+        let seconds = (cpu_scan.uptime? - starttime as f64 / clk_tck).max(0.0);
         let total_ticks = utime + stime;
         let key = (pid, starttime);
         // A process listening on multiple sockets gets one CPU reading per scan.
@@ -509,9 +475,7 @@ fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, f32, u64) {
         });
         Some((cpu, seconds as u64))
     })()
-    .unwrap_or((0.0, 0));
-
-    (cpu_percent, mem_mb, uptime_secs)
+    .unwrap_or((0.0, 0))
 }
 
 fn merge_entries_by_port(entries: Vec<PortEntry>) -> Vec<PortEntry> {
@@ -530,201 +494,110 @@ fn merge_entries_by_port(entries: Vec<PortEntry>) -> Vec<PortEntry> {
     by_port.into_values().collect()
 }
 
-// ─── Port scanning via `ss` (fast) ───────────────────────────────────────────
-//
-// `ss -tlnp` output (no header):
-//   LISTEN 0 128 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=1234,fd=22))
-//   LISTEN 0 128 [::]:8080    [::]:*     users:(("python3",pid=5678,fd=5))
+// ─── Listening sockets and their process owners ────────────────────────────────
 
-fn scan_with_ss(show_all: bool) -> Option<Vec<PortEntry>> {
-    let output = std::process::Command::new("ss")
-        .args(["-tlnp", "--no-header"])
-        .output()
-        .ok()?;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListeningSocket {
+    port: u16,
+    inode: u64,
+    uid: u32,
+}
 
-    if !output.status.success() {
+fn parse_proc_tcp_line(line: &str) -> Option<ListeningSocket> {
+    let mut fields = line.split_whitespace();
+    let port = u16::from_str_radix(fields.nth(1)?.rsplit_once(':')?.1, 16).ok()?;
+    if fields.nth(1)? != "0A" {
         return None;
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-    let mut cpu_scan = CpuScan::new();
-
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // Fields: State RecvQ SendQ LocalAddr:Port PeerAddr:Port [Process...]
-        // Process names can contain spaces (e.g. next-server (v16.2.7)), so the
-        // users:(...) blob may span multiple whitespace-separated fields.
-        if fields.len() < 5 {
-            continue;
-        }
-
-        let local = fields[3]; // e.g. "0.0.0.0:3000" or "[::]:8080" or "*:18789"
-        let port_str = local.rsplit(':').next().unwrap_or("");
-        let Ok(port) = port_str.parse::<u16>() else {
-            continue;
-        };
-
-        // Prefer the full users:(...) span from the raw line — not fields[5] alone.
-        let process_info = line
-            .find("users:(")
-            .map(|idx| &line[idx..])
-            .unwrap_or("");
-        let (pid, ss_name) = parse_ss_process(process_info);
-        let mut pids = parse_ss_pids(process_info);
-        if pids.is_empty() && pid > 0 {
-            pids.push(pid);
-        }
-
-        // Only show ports that have an associated process we can identify, 
-        // to filter out system-level ports (like 53 for DNS) that we can't manage.
-        if !show_all && pid == 0 && ss_name.is_empty() {
-            continue;
-        }
-
-        let cmdline = if pid > 0 { get_cmdline(pid) } else { String::new() };
-        let cwd = if pid > 0 { get_process_cwd(pid) } else { String::new() };
-        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 {
-            get_process_stats(pid, &mut cpu_scan)
-        } else {
-            (0.0, 0.0, 0)
-        };
-        let process_name = resolve_display_name(pid, &ss_name, &cmdline);
-
-        entries.push(make_port_entry(
-            port,
-            pid,
-            pids,
-            process_name,
-            cmdline,
-            cwd,
-            cpu_percent,
-            mem_mb,
-            uptime_seconds,
-        ));
-    }
-
-    cpu_scan.finish();
-    Some(merge_entries_by_port(entries))
+    let uid = fields.nth(3)?.parse().ok()?;
+    let inode = fields.nth(1)?.parse().ok()?;
+    (inode != 0).then_some(ListeningSocket { port, inode, uid })
 }
 
-/// Parse `users:(("node",pid=1234,fd=5))` → (1234, "node")
-fn parse_ss_process(users: &str) -> (u32, String) {
-    // Find pid=NNN
-    let pid = users
-        .split("pid=")
-        .nth(1)
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.split(')').next())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-
-    // Find process name between first `("` and `"`
-    let name = users
-        .split("((\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .unwrap_or("")
-        .to_string();
-
-    (pid, name)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketOwner {
+    pid: u32,
+    fd: u32,
 }
 
-fn parse_ss_pids(users: &str) -> Vec<u32> {
-    users
-        .split("pid=")
-        .skip(1)
-        .filter_map(|chunk| {
-            let digits: String = chunk.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            digits.parse::<u32>().ok()
-        })
-        .collect()
+type InodeOwners = HashMap<u64, Vec<SocketOwner>>;
+
+fn prune_inode_owners(
+    cache: &mut InodeOwners,
+    listening_inodes: &HashSet<u64>,
+    still_owns: impl Fn(u64, SocketOwner) -> bool,
+) -> bool {
+    cache.retain(|inode, owners| {
+        listening_inodes.contains(inode) && owners.iter().all(|&owner| still_owns(*inode, owner))
+    });
+    listening_inodes.iter().any(|inode| !cache.contains_key(inode))
 }
 
-// ─── Fallback: /proc/net/tcp parsing ─────────────────────────────────────────
+fn socket_inode(target: &std::path::Path) -> Option<u64> {
+    target.to_str()?.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+}
 
-fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
-    use std::path::Path;
-
-    // Build inode → pid map
-    let mut inode_to_pid: HashMap<u64, u32> = HashMap::new();
+fn discover_inode_owners(listening_inodes: &HashSet<u64>) -> InodeOwners {
+    let mut cache: InodeOwners = listening_inodes.iter().map(|&inode| (inode, Vec::new())).collect();
     if let Ok(procs) = fs::read_dir("/proc") {
-        for entry in procs.flatten() {
-            let name = entry.file_name();
-            let Some(pid_str) = name.to_str() else { continue };
-            let Ok(pid) = pid_str.parse::<u32>() else { continue };
-            let fd_dir = Path::new("/proc").join(pid_str).join("fd");
-            let Ok(fds) = fs::read_dir(&fd_dir) else { continue };
+        for process in procs.flatten() {
+            let Some(pid) = process.file_name().to_str().and_then(|name| name.parse().ok()) else {
+                continue;
+            };
+            let Ok(fds) = fs::read_dir(process.path().join("fd")) else {
+                continue;
+            };
             for fd in fds.flatten() {
-                if let Ok(target) = fs::read_link(fd.path()) {
-                    let s = target.to_string_lossy();
-                    if s.starts_with("socket:[") && s.ends_with(']') {
-                        if let Ok(inode) = s[8..s.len() - 1].parse::<u64>() {
-                            inode_to_pid.insert(inode, pid);
-                        }
+                let Ok(target) = fs::read_link(fd.path()) else { continue };
+                let Some(owners) = socket_inode(&target).and_then(|inode| cache.get_mut(&inode)) else {
+                    continue;
+                };
+                if let Some(fd) = fd.file_name().to_str().and_then(|name| name.parse().ok()) {
+                    if !owners.iter().any(|owner| owner.pid == pid) {
+                        owners.push(SocketOwner { pid, fd });
                     }
                 }
             }
         }
     }
-
-    let mut cpu_scan = CpuScan::new();
-    let mut all = parse_proc_tcp("/proc/net/tcp", &inode_to_pid, show_all, &mut cpu_scan);
-    all.extend(parse_proc_tcp("/proc/net/tcp6", &inode_to_pid, show_all, &mut cpu_scan));
-
-    cpu_scan.finish();
-    merge_entries_by_port(all)
+    cache
 }
 
-fn parse_proc_tcp(
-    path: &str,
-    inode_to_pid: &HashMap<u64, u32>,
-    show_all: bool,
-    cpu_scan: &mut CpuScan,
-) -> Vec<PortEntry> {
-    let Ok(content) = fs::read_to_string(path) else { return vec![] };
-    let mut results = Vec::new();
-
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 10 || fields[3] != "0A" { continue; }
-
-        let inode: u64 = fields[9].parse().unwrap_or(0);
-        if inode == 0 { continue; }
-
-        // Decode port from local_address hex (last 4 hex chars after ':')
-        let local = fields[1];
-        let port_hex = local.rsplit(':').next().unwrap_or("");
-        let Ok(port) = u16::from_str_radix(port_hex, 16) else { continue };
-
-        let pid = inode_to_pid.get(&inode).copied().unwrap_or(0);
-        let pids = if pid > 0 { vec![pid] } else { vec![] };
-        let cmdline = if pid > 0 { get_cmdline(pid) } else { String::new() };
-        let process_name = resolve_display_name(pid, "", &cmdline);
-
-        if !show_all && pid == 0 {
-            continue;
+fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
+    static INODE_OWNERS: OnceLock<Mutex<InodeOwners>> = OnceLock::new();
+    let mut cache = INODE_OWNERS.get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut sockets = Vec::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(content) = fs::read_to_string(path) {
+            sockets.extend(content.lines().skip(1).filter_map(parse_proc_tcp_line));
         }
-        let cwd = if pid > 0 { get_process_cwd(pid) } else { String::new() };
-        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 {
-            get_process_stats(pid, cpu_scan)
-        } else {
-            (0.0, 0.0, 0)
-        };
-
-        results.push(make_port_entry(
-            port,
-            pid,
-            pids,
-            process_name,
-            cmdline,
-            cwd,
-            cpu_percent,
-            mem_mb,
-            uptime_seconds,
-        ));
     }
-    results
+    let listening_inodes = sockets.iter().map(|socket| socket.inode).collect();
+
+    // Checking the cached FD also catches closed listeners and PID reuse before a kill.
+    if prune_inode_owners(&mut cache, &listening_inodes, |inode, owner| {
+        fs::read_link(format!("/proc/{}/fd/{}", owner.pid, owner.fd))
+            .ok().and_then(|target| socket_inode(&target)) == Some(inode)
+    }) {
+        // Cache unreadable sockets too, or system listeners would trigger a full walk every poll.
+        *cache = discover_inode_owners(&listening_inodes);
+    }
+
+    let mut cpu_scan = CpuScan::new();
+    let mut entries = Vec::new();
+    for socket in sockets {
+        let owners = &cache[&socket.inode];
+        if owners.is_empty() && show_all {
+            entries.push(make_port_entry(socket, 0, &mut cpu_scan));
+        }
+        for owner in owners {
+            entries.push(make_port_entry(socket, owner.pid, &mut cpu_scan));
+        }
+    }
+    cpu_scan.finish();
+    merge_entries_by_port(entries)
 }
 
 // ─── Tauri Commands ───────────────────────────────────────────────────────────
@@ -735,24 +608,10 @@ async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
 
     let (tx, rx) = mpsc::channel();
     tauri::async_runtime::spawn_blocking(move || {
-        let res = if let Some(entries) = scan_with_ss(show_all) {
-            append_log(&format!(
-                ">>> scan_with_ss succeeded with {} entries",
-                entries.len()
-            ));
-            entries
-        } else {
-            append_log(">>> scan_with_ss failed, falling back to scan_with_proc");
-            let entries = scan_with_proc(show_all);
-            append_log(&format!(
-                ">>> scan_with_proc succeeded with {} entries",
-                entries.len()
-            ));
-            entries
-        };
-
+        let entries = scan_with_proc(show_all);
+        append_log(&format!(">>> scan_with_proc returned {} entries", entries.len()));
         append_log(">>> scan_ports returning to JS");
-        let _ = tx.send(res);
+        let _ = tx.send(entries);
     });
 
     tauri::async_runtime::spawn_blocking(move || match rx.recv_timeout(Duration::from_secs(10)) {
@@ -1002,6 +861,42 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn parses_only_listening_tcp_sockets_from_both_address_families() {
+        let ipv4 = "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 321";
+        let ipv6 = "1: 00000000000000000000000001000000:2329 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1001 0 654";
+        assert_eq!(
+            parse_proc_tcp_line(ipv4),
+            Some(ListeningSocket { port: 8080, inode: 321, uid: 1000 })
+        );
+        assert_eq!(
+            parse_proc_tcp_line(ipv6),
+            Some(ListeningSocket { port: 9001, inode: 654, uid: 1001 })
+        );
+        assert_eq!(parse_proc_tcp_line(&ipv4.replace(" 0A ", " 01 ")), None);
+        assert_eq!(parse_proc_tcp_line("0: 0100007F:1F90 00000000:0000 0A"), None);
+    }
+
+    #[test]
+    fn prunes_closed_and_stale_inodes_and_keeps_cache_hits() {
+        let owner = SocketOwner { pid: 42, fd: 3 };
+        let stale = SocketOwner { pid: 43, fd: 4 };
+        let mut cache = HashMap::from([
+            (1, vec![owner]),
+            (2, vec![stale]),
+            (3, vec![owner]),
+            (4, vec![]),
+        ]);
+        let listening = HashSet::from([1, 4]);
+        assert!(!prune_inode_owners(&mut cache, &listening, |_, _| true));
+        assert_eq!(cache, HashMap::from([(1, vec![owner]), (4, vec![])]));
+
+        let with_new_listener = HashSet::from([1, 4, 5]);
+        assert!(prune_inode_owners(&mut cache, &with_new_listener, |_, _| true));
+        assert!(prune_inode_owners(&mut cache, &listening, |_, _| false));
+        assert_eq!(cache, HashMap::from([(4, vec![])]));
+    }
+
+    #[test]
     fn resolves_scoped_unscoped_and_bin_package_names() {
         for (path, name) in [
             ("/project/node_modules/@openai/codex/vendor/bin/codex", "codex"),
@@ -1189,9 +1084,7 @@ mod tests {
     #[test]
     #[ignore = "requires live localhost ports (same-user next on :3000, ulauncher on :5054)"]
     fn scan_marks_next_killable_and_ulauncher_protected() {
-        let Some(entries) = scan_with_ss(true) else {
-            return;
-        };
+        let entries = scan_with_proc(true);
 
         if let Some(next) = entries.iter().find(|e| e.port == 3000) {
             eprintln!(
