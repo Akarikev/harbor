@@ -1,8 +1,6 @@
 // harbor — frontend logic
 // Calls Tauri Rust commands via __TAURI_INTERNALS__
 
-const SCAN_TIMEOUT_MS = 10000;
-
 const THEME_LABELS = {
   light: 'Light',
   system: 'Follow system',
@@ -41,7 +39,11 @@ function getCurrentAppWindow() {
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let ports = [];
+let popupFocused = false;
+let hideTimeout = null;
 let refreshInterval = null;
+let scanInFlight = false;
+let latestScanRequest = 0;
 let currentTheme = 'system';
 let showAllPorts = false;
 let confirmBeforeKill = true;
@@ -299,16 +301,15 @@ function applyTheme(theme) {
   setCustomSelectValue(themeSelect, theme, THEME_LABELS);
 }
 
+function restartRefreshInterval(ms) {
+  clearInterval(refreshInterval);
+  refreshInterval = popupFocused && ms > 0 ? setInterval(refresh, ms) : null;
+}
+
 function applyRefreshInterval(ms) {
   const parsed = Number(ms);
   localStorage.setItem('harbor-refresh-interval', String(parsed));
-  if (refreshInterval !== null) {
-    clearInterval(refreshInterval);
-    refreshInterval = null;
-  }
-  if (parsed > 0) {
-    refreshInterval = setInterval(() => refresh(), parsed);
-  }
+  restartRefreshInterval(parsed);
   setCustomSelectValue(refreshSelect, parsed, REFRESH_LABELS);
 }
 
@@ -408,7 +409,7 @@ async function killEntry(entryRef, { force = false } = {}) {
     await invokeCommand('kill_processes', { pids: killPids, force: useForce });
     const row = portList.querySelector(`.port-row[data-port="${entry.port}"]`);
     if (row) removeRow(entry.port, row);
-    setTimeout(() => refresh(), 300);
+    refresh({ supersede: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error('kill_processes failed:', err);
@@ -417,30 +418,32 @@ async function killEntry(entryRef, { force = false } = {}) {
 }
 
 // ─── Port scanning ────────────────────────────────────────────────────────────
-async function refresh() {
-  loadingState.classList.remove('hidden');
-  emptyState.classList.add('hidden');
+async function refresh({ supersede = false } = {}) {
+  if (!popupFocused || (scanInFlight && !supersede)) return;
+  const requestId = ++latestScanRequest;
+  if (scanInFlight) return;
 
-  let timeoutId = null;
+  scanInFlight = true;
+  if (ports.length === 0) {
+    loadingState.classList.remove('hidden');
+    emptyState.classList.add('hidden');
+  }
+
   try {
-    const result = await Promise.race([
-      invokeCommand('scan_ports', { showAll: showAllPorts }),
-      new Promise((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error('scan timed out')), SCAN_TIMEOUT_MS);
-      }),
-    ]);
-
+    const result = await invokeCommand('scan_ports', { showAll: showAllPorts });
+    if (requestId !== latestScanRequest) return;
     ports = Array.isArray(result) ? result : [];
     render();
   } catch (err) {
+    if (requestId !== latestScanRequest) return;
     console.error('scan_ports failed:', err);
-    loadingState.classList.add('hidden');
     emptyState.classList.remove('hidden');
     document.getElementById('empty-title').textContent =
       'Error scanning ports: ' + (err instanceof Error ? err.message : String(err));
   } finally {
-    if (timeoutId !== null) clearTimeout(timeoutId);
+    scanInFlight = false;
     loadingState.classList.add('hidden');
+    if (requestId !== latestScanRequest) refresh();
   }
 }
 
@@ -749,12 +752,12 @@ function escapeHtml(str) {
 // ─── Events ───────────────────────────────────────────────────────────────────
 showAllToggle.addEventListener('change', () => {
   applyShowAll(showAllToggle.checked);
-  refresh();
+  refresh({ supersede: true });
 });
 
 showAllToggleSettings.addEventListener('change', () => {
   applyShowAll(showAllToggleSettings.checked);
-  refresh();
+  refresh({ supersede: true });
 });
 
 confirmKillToggle.addEventListener('change', () => {
@@ -812,13 +815,25 @@ quitBtn.addEventListener('click', async () => {
   }
 });
 
-window.addEventListener('blur', () => {
-  setTimeout(async () => {
+function handlePopupFocus(focused) {
+  if (popupFocused === focused) return;
+  popupFocused = focused;
+  restartRefreshInterval(getSavedRefreshInterval());
+
+  if (focused) {
+    clearTimeout(hideTimeout);
+    hideTimeout = null;
+    refresh({ supersede: true });
+    return;
+  }
+
+  ++latestScanRequest;
+  hideTimeout = setTimeout(async () => {
     try {
       await getCurrentAppWindow()?.hide();
     } catch (_) {}
   }, 200);
-});
+}
 
 window.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
@@ -839,7 +854,15 @@ async function init() {
   applyShowAll(getSavedShowAll());
   applyConfirmBeforeKill(getSavedConfirmBeforeKill());
   applyKillAction(getSavedKillAction());
-  await refresh();
+  const appWindow = getCurrentAppWindow();
+  let focusEventCount = 0;
+  await appWindow.onFocusChanged(({ payload }) => {
+    ++focusEventCount;
+    handlePopupFocus(payload);
+  });
+  const focusEventCountAtQuery = focusEventCount;
+  const focused = await appWindow.isFocused();
+  if (focusEventCountAtQuery === focusEventCount) handlePopupFocus(focused);
 }
 
-init();
+init().catch((err) => console.error('window initialization failed:', err));

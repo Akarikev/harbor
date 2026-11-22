@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::sync::{mpsc, OnceLock};
-use std::time::Duration;
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -443,7 +443,41 @@ fn parse_proc_stat(stat: &str) -> Option<(u64, u64, u64)> {
     Some((utime, stime, starttime))
 }
 
-fn get_process_stats(pid: u32) -> (f32, f32, u64) {
+type ProcessKey = (u32, u64);
+type CpuSamples = HashMap<ProcessKey, (u64, Instant)>;
+
+struct CpuScan {
+    // Keep sample updates and pruning together if another scan is already running.
+    samples: MutexGuard<'static, CpuSamples>,
+    readings: HashMap<ProcessKey, f32>,
+}
+
+impl CpuScan {
+    fn new() -> Self {
+        static CPU_SAMPLES: OnceLock<Mutex<CpuSamples>> = OnceLock::new();
+        Self {
+            samples: CPU_SAMPLES
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+            readings: HashMap::new(),
+        }
+    }
+
+    fn finish(mut self) {
+        self.samples.retain(|key, _| self.readings.contains_key(key));
+    }
+}
+
+fn cpu_usage_percent(delta_ticks: u64, elapsed_secs: f64, clk_tck: f64, cpus: f32) -> f32 {
+    if elapsed_secs <= 0.0 {
+        return 0.0;
+    }
+    (delta_ticks as f64 / clk_tck / elapsed_secs * 100.0).clamp(0.0, 100.0 * f64::from(cpus))
+        as f32
+}
+
+fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, f32, u64) {
     let mem_mb = fs::read_to_string(format!("/proc/{}/status", pid))
         .unwrap_or_default()
         .lines()
@@ -455,17 +489,28 @@ fn get_process_stats(pid: u32) -> (f32, f32, u64) {
 
     let (cpu_percent, uptime_secs) = (|| -> Option<(f32, u64)> {
         let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        let now = Instant::now();
         let (utime, stime, starttime) = parse_proc_stat(&stat)?;
         let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
         let uptime: f64 = uptime_str.split_whitespace().next()?.parse().ok()?;
         let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         let clk_tck = if clk_tck > 0 { clk_tck as f64 } else { 100.0 };
-        let seconds = uptime - (starttime as f64 / clk_tck);
-        if seconds <= 0.0 {
-            return Some((0.0, 0));
-        }
-        let cpu = ((utime + stime) as f64 / clk_tck / seconds * 100.0) as f32;
-        Some((cpu.min(100.0 * num_cpus()), seconds as u64))
+        let seconds = (uptime - starttime as f64 / clk_tck).max(0.0);
+        let total_ticks = utime + stime;
+        let key = (pid, starttime);
+        // A process listening on multiple sockets gets one CPU reading per scan.
+        let cpu = *cpu_scan.readings.entry(key).or_insert_with(|| {
+            let previous_sample = cpu_scan.samples.insert(key, (total_ticks, now));
+            let (delta_ticks, elapsed_secs) = match previous_sample {
+                Some((previous_ticks, previous_time)) => (
+                    total_ticks.saturating_sub(previous_ticks),
+                    now.duration_since(previous_time).as_secs_f64(),
+                ),
+                None => (total_ticks, seconds),
+            };
+            cpu_usage_percent(delta_ticks, elapsed_secs, clk_tck, num_cpus())
+        });
+        Some((cpu, seconds as u64))
     })()
     .unwrap_or((0.0, 0));
 
@@ -506,6 +551,7 @@ fn scan_with_ss(show_all: bool) -> Option<Vec<PortEntry>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut entries = Vec::new();
+    let mut cpu_scan = CpuScan::new();
 
     for line in stdout.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -541,7 +587,11 @@ fn scan_with_ss(show_all: bool) -> Option<Vec<PortEntry>> {
 
         let cmdline = if pid > 0 { get_cmdline(pid) } else { String::new() };
         let cwd = if pid > 0 { get_process_cwd(pid) } else { String::new() };
-        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 { get_process_stats(pid) } else { (0.0, 0.0, 0) };
+        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 {
+            get_process_stats(pid, &mut cpu_scan)
+        } else {
+            (0.0, 0.0, 0)
+        };
         let process_name = resolve_display_name(pid, &ss_name, &cmdline);
 
         entries.push(make_port_entry(
@@ -557,6 +607,7 @@ fn scan_with_ss(show_all: bool) -> Option<Vec<PortEntry>> {
         ));
     }
 
+    cpu_scan.finish();
     Some(merge_entries_by_port(entries))
 }
 
@@ -596,7 +647,6 @@ fn parse_ss_pids(users: &str) -> Vec<u32> {
 // ─── Fallback: /proc/net/tcp parsing ─────────────────────────────────────────
 
 fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
-    use std::collections::HashMap;
     use std::path::Path;
 
     // Build inode → pid map
@@ -621,13 +671,20 @@ fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
         }
     }
 
-    let mut all = parse_proc_tcp("/proc/net/tcp", &inode_to_pid, show_all);
-    all.extend(parse_proc_tcp("/proc/net/tcp6", &inode_to_pid, show_all));
+    let mut cpu_scan = CpuScan::new();
+    let mut all = parse_proc_tcp("/proc/net/tcp", &inode_to_pid, show_all, &mut cpu_scan);
+    all.extend(parse_proc_tcp("/proc/net/tcp6", &inode_to_pid, show_all, &mut cpu_scan));
 
+    cpu_scan.finish();
     merge_entries_by_port(all)
 }
 
-fn parse_proc_tcp(path: &str, inode_to_pid: &std::collections::HashMap<u64, u32>, show_all: bool) -> Vec<PortEntry> {
+fn parse_proc_tcp(
+    path: &str,
+    inode_to_pid: &HashMap<u64, u32>,
+    show_all: bool,
+    cpu_scan: &mut CpuScan,
+) -> Vec<PortEntry> {
     let Ok(content) = fs::read_to_string(path) else { return vec![] };
     let mut results = Vec::new();
 
@@ -652,7 +709,11 @@ fn parse_proc_tcp(path: &str, inode_to_pid: &std::collections::HashMap<u64, u32>
             continue;
         }
         let cwd = if pid > 0 { get_process_cwd(pid) } else { String::new() };
-        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 { get_process_stats(pid) } else { (0.0, 0.0, 0) };
+        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 {
+            get_process_stats(pid, cpu_scan)
+        } else {
+            (0.0, 0.0, 0)
+        };
 
         results.push(make_port_entry(
             port,
@@ -918,6 +979,15 @@ mod tests {
     fn rejects_incomplete_proc_stat() {
         assert_eq!(parse_proc_stat("123 missing-comm S 4 5"), None);
         assert_eq!(parse_proc_stat("123 (node) S 4 5"), None);
+    }
+
+    #[test]
+    fn calculates_cpu_usage_from_elapsed_time_and_ticks() {
+        assert_eq!(cpu_usage_percent(50, 2.0, 100.0, 4.0), 25.0);
+        assert_eq!(cpu_usage_percent(50, 0.0, 100.0, 4.0), 0.0);
+        assert_eq!(cpu_usage_percent(50, -1.0, 100.0, 4.0), 0.0);
+        assert_eq!(cpu_usage_percent(0, 1.0, 100.0, 4.0), 0.0);
+        assert_eq!(cpu_usage_percent(1000, 1.0, 100.0, 4.0), 400.0);
     }
 
     #[test]
