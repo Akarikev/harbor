@@ -1,11 +1,10 @@
 [package]
 name = "harbor"
-version = "0.1.0"
+version = "0.2.0"
 description = "See every dev server running on localhost from your system tray"
 authors = ["Akarikev"]
 license = "MIT"
 repository = "https://github.com/Akarikev/harbor"
-homepage = "https://github.com/Akarikev/harbor"
 edition = "2021"
 
 [lib]

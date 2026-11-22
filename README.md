@@ -23,33 +23,29 @@ chmod +x harbor_*_amd64.AppImage
 ./harbor_*_amd64.AppImage
 ```
 
+### GNOME top bar
+
+In harbor, open **Settings → GNOME** and click **Enable**, then sign out and back in. While the companion extension is active, its top-bar button replaces the tray icon.
+
 ### Autostart
 
-The Debian and RPM packages start harbor automatically at login. To disable it, use your desktop's Startup Applications settings or copy `/etc/xdg/autostart/harbor.desktop` to `~/.config/autostart/` and set `Hidden=true` in the copy.
-
-For AppImage autostart, create `~/.config/autostart/harbor.desktop` with the absolute path to your AppImage:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=harbor
-Exec=/path/to/harbor.AppImage --hidden
-```
+Use **Settings → Start at login** to change autostart for your account. The Debian and RPM packages enable it by default through `/etc/xdg/autostart/harbor.desktop`. The AppImage starts on demand by default. Move it to a permanent location before enabling the setting, since harbor saves its absolute path.
 
 ## Features
 
-- Tray icon with port list popup
+- StatusNotifierItem tray icon and optional GNOME top-bar button
 - CPU, memory, uptime, and energy indicators
 - Kill / force-kill with confirmation
 - Open localhost URLs in browser
 - System process protection
 - Dark / light / system theme
+- Start at login
 
 ## System requirements
 
 - Linux x86_64
-- GTK 3 + WebKitGTK 4.1
-- System tray support (X11 or Wayland with appindicator)
+- GTK 3, WebKitGTK 4.1, and gtk-layer-shell
+- A StatusNotifierItem host or the harbor GNOME Shell extension for panel access
 
 ### Build dependencies (Ubuntu/Debian)
 
@@ -58,7 +54,7 @@ sudo apt update
 sudo apt install -y \
   libwebkit2gtk-4.1-dev \
   libgtk-3-dev \
-  libayatana-appindicator3-dev \
+  libgtk-layer-shell-dev \
   librsvg2-dev \
   patchelf \
   build-essential \
@@ -67,13 +63,13 @@ sudo apt install -y \
 
 ## Build from source
 
-Requires [Rust](https://rustup.rs/) and [Bun](https://bun.sh/) (or Node.js + npm).
+Requires [Rust](https://rustup.rs/) and [Bun](https://bun.sh/).
 
 ```bash
 git clone https://github.com/Akarikev/harbor.git
 cd harbor
 bun install
-bun run dev      # development
+bun run dev      # development with frontend live reload
 bun run build    # release bundles
 ```
 
