@@ -91,6 +91,9 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   pointer-events: none;
   background: url("assets/grain.png");
   opacity: .08;
+  /* Own compositor layer: painted once instead of on every row update (~45 -> ~7 WebKit ticks/30s idle-open). */
+  will-change: transform;
+  transform: translateZ(0);
 }
 
 .bar {
