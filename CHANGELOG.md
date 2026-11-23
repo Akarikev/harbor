@@ -2,6 +2,17 @@
 
 All notable changes to harbor are documented in this file.
 
+## [0.3.1]
+
+### Fixed
+
+- **Theme setting works with desktop blur.** Light and Dark had no visible effect while the desktop's blur was on, because the desktop palette overrode harbor's theme colours. Now System, Light and Dark all follow the desktop's own menu tint for that scheme, while the blur and corner radius stay:
+  - **GNOME:** the other scheme's tint is read offscreen from the shell's light/dark stylesheets (including Ubuntu's Yaru and Blur my Shell's adaptive tint), without restyling the desktop.
+  - **KDE Plasma:** it comes from the configured light/dark colour-scheme pair (Breeze Light/Dark by default) and updates live when the scheme changes.
+  - **Fallback:** when no tint exists for that scheme, harbor uses its own colours at the desktop's translucency. Without blur, nothing changes.
+- **Popup stays on the top bar's monitor.** Plugging in or unplugging a monitor while the popup was open could move it onto a screen without the top bar. The GNOME extension now re-places it after the layout settles and caps its height to that monitor's work area.
+- Removed the hover-switching known issue; switching between harbor and other top-bar menus works.
+
 ## [0.3.0]
 
 ### Added
