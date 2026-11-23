@@ -54,19 +54,41 @@ impl HarborService {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> fdo::Result<()> {
-        let owner = fdo::DBusProxy::new(connection)
-            .await?
-            .get_name_owner(PRESENCE_NAME.try_into().expect("valid bus name"))
-            .await?;
-        if header.sender() != Some(&owner) {
-            return Err(fdo::Error::AccessDenied("Only the harbor extension can set blur".into()));
-        }
+        require_extension(&header, connection).await?;
         let palette = parse_palette(active, &palette)
             .map_err(|message| fdo::Error::InvalidArgs(message.into()))?;
         append_log(&format!(">>> GNOME blur active={active}"));
         popup::set_blur_palette(&self.app, palette);
         Ok(())
     }
+
+    async fn set_panel_work_height(
+        &self,
+        height: u32,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> fdo::Result<()> {
+        require_extension(&header, connection).await?;
+        if height == 0 {
+            return Err(fdo::Error::InvalidArgs("Expected a positive work-area height".into()));
+        }
+        popup::set_panel_work_height(&self.app, Some(height));
+        Ok(())
+    }
+}
+
+async fn require_extension(
+    header: &zbus::message::Header<'_>,
+    connection: &zbus::Connection,
+) -> fdo::Result<()> {
+    let owner = fdo::DBusProxy::new(connection)
+        .await?
+        .get_name_owner(PRESENCE_NAME.try_into().expect("valid bus name"))
+        .await?;
+    if header.sender() != Some(&owner) {
+        return Err(fdo::Error::AccessDenied("Only the harbor extension can update panel state".into()));
+    }
+    Ok(())
 }
 
 /// Serve the D-Bus API and keep the tray icon off while the extension is active.
@@ -109,23 +131,39 @@ async fn serve(app: AppHandle) -> zbus::Result<()> {
     Ok(())
 }
 
-/// Decode SetBlur's palette: panel RGBA, bar RGBA, optional theme text RGBA, optional radius.
+/// The paired format prefixes the current scheme and radius to two sets of menu colors.
+/// Older extensions send current colors followed by an optional radius.
 fn parse_palette(active: bool, palette: &[u8]) -> Result<Option<popup::BlurPalette>, &'static str> {
+    use popup::{BlurPalette, ColorScheme, MenuColors};
+
+    let colors = |bytes: &[u8]| match bytes {
+        [r, g, b, a, br, bg, bb, ba, rest @ ..] => Some(MenuColors {
+            panel: [*r, *g, *b, *a],
+            bar: [*br, *bg, *bb, *ba],
+            text: rest.try_into().ok(),
+        }),
+        _ => None,
+    };
     Ok(match (active, palette) {
-        (true, [r, g, b, a, br, bg, bb, ba, rest @ ..]) if rest.len() <= 5 => {
-            let (text, radius) = match rest {
-                [tr, tg, tb, ta, radius @ ..] => (Some([*tr, *tg, *tb, *ta]), radius),
-                radius => (None, radius),
-            };
-            Some(popup::BlurPalette {
-                panel: [*r, *g, *b, *a],
-                bar: [*br, *bg, *bb, *ba],
-                text,
-                corner_radius: radius.first().copied(),
+        (true, [scheme @ (0 | 1), radius, bytes @ ..]) if matches!(bytes.len(), 12 | 24) => {
+            Some(BlurPalette {
+                current: colors(&bytes[..12]).unwrap(),
+                alternate: colors(&bytes[12..]),
+                scheme: Some(if *scheme == 0 { ColorScheme::Light } else { ColorScheme::Dark }),
+                corner_radius: Some(*radius),
+            })
+        }
+        (true, bytes) if matches!(bytes.len(), 8 | 9 | 12 | 13) => {
+            let end = if bytes.len() <= 9 { 8 } else { 12 };
+            Some(BlurPalette {
+                current: colors(&bytes[..end]).unwrap(),
+                alternate: None,
+                scheme: None,
+                corner_radius: bytes.get(end).copied(),
             })
         }
         (_, []) => None,
-        _ => return Err("Expected two RGBA colors, an optional text color and an optional radius"),
+        _ => return Err("Expected a current palette and an optional alternate palette"),
     })
 }
 
@@ -137,6 +175,7 @@ async fn set_extension_active(app: &AppHandle, active: bool) {
     } else {
         if was_active {
             popup::set_blur_palette(app, None);
+            popup::set_panel_work_height(app, None);
         }
         start_tray(app.clone()).await;
     }
@@ -265,14 +304,38 @@ mod tests {
     fn decodes_palette_with_and_without_text_and_radius() {
         let base = [1, 2, 3, 4, 5, 6, 7, 8];
         let p = parse_palette(true, &base).unwrap().unwrap();
-        assert_eq!((p.panel, p.bar, p.text, p.corner_radius), ([1, 2, 3, 4], [5, 6, 7, 8], None, None));
+        assert_eq!((p.current.panel, p.current.bar, p.current.text, p.corner_radius), ([1, 2, 3, 4], [5, 6, 7, 8], None, None));
         let p = parse_palette(true, &[&base[..], &[20]].concat()).unwrap().unwrap();
-        assert_eq!((p.text, p.corner_radius), (None, Some(20)));
+        assert_eq!((p.current.text, p.corner_radius), (None, Some(20)));
         let p = parse_palette(true, &[&base[..], &[9, 10, 11, 255]].concat()).unwrap().unwrap();
-        assert_eq!((p.text, p.corner_radius), (Some([9, 10, 11, 255]), None));
+        assert_eq!((p.current.text, p.corner_radius), (Some([9, 10, 11, 255]), None));
         let p = parse_palette(true, &[&base[..], &[9, 10, 11, 255, 20]].concat()).unwrap().unwrap();
-        assert_eq!((p.text, p.corner_radius), (Some([9, 10, 11, 255]), Some(20)));
+        assert_eq!((p.current.text, p.corner_radius), (Some([9, 10, 11, 255]), Some(20)));
         assert!(parse_palette(false, &[]).unwrap().is_none());
         assert!(parse_palette(true, &[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn decodes_paired_palettes_and_rejects_invalid_pairs() {
+        use crate::popup::{ColorScheme, MenuColors};
+
+        let current = [1, 2, 3, 100, 4, 5, 6, 120, 7, 8, 9, 255];
+        let alternate = [10, 11, 12, 200, 13, 14, 15, 220, 16, 17, 18, 240];
+        let paired = [&[1, 20][..], &current, &alternate].concat();
+        let p = parse_palette(true, &paired).unwrap().unwrap();
+        assert_eq!(p.scheme, Some(ColorScheme::Dark));
+        assert_eq!(p.corner_radius, Some(20));
+        assert_eq!(p.current.panel, [1, 2, 3, 100]);
+        assert_eq!(p.alternate, Some(MenuColors {
+            panel: [10, 11, 12, 200],
+            bar: [13, 14, 15, 220],
+            text: Some([16, 17, 18, 240]),
+        }));
+        let p = parse_palette(true, &[&[0, 20][..], &current].concat()).unwrap().unwrap();
+        assert_eq!(p.scheme, Some(ColorScheme::Light));
+        assert!(p.alternate.is_none());
+        assert!(parse_palette(true, &paired[..25]).is_err());
+        assert!(parse_palette(false, &paired).is_err());
+        assert!(parse_palette(true, &[&[2, 20][..], &current].concat()).is_err());
     }
 }

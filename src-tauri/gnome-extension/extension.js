@@ -5,7 +5,6 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
-import Meta from 'gi://Meta';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 
@@ -133,6 +132,7 @@ export default class HarborExtension extends Extension {
         this._presence = Gio.bus_own_name(Gio.BusType.SESSION, PRESENCE_NAME,
             Gio.BusNameOwnerFlags.NONE, null, () => this._blur.refresh(true), null);
         this._harborPid = 0;
+        this._panelWorkHeight = null;
         this._harborWatch = Gio.bus_watch_name(Gio.BusType.SESSION, BUS_NAME,
             Gio.BusNameWatcherFlags.NONE,
             () => {
@@ -147,13 +147,24 @@ export default class HarborExtension extends Extension {
             },
             () => {
                 this._harborPid = 0;
+                this._panelWorkHeight = null;
                 this._button?.container.hide();
             });
         this._tracked = new Map();
         this._menuSources = new Set();
-        this._laters = global.compositor?.get_laters?.();
         this._mapped = global.window_manager.connect('map',
             (_wm, actor) => this._onMap(actor.get_meta_window()));
+        const queuePopup = () => {
+            if (this._popup)
+                this._queuePlace(this._popup);
+        };
+        Main.layoutManager.connectObject('monitors-changed', queuePopup, this);
+        global.display.connectObject('workareas-changed', queuePopup, this);
+        this._panelActors = [Main.layoutManager.panelBox, Main.panel, this._button];
+        for (const actor of this._panelActors) {
+            actor.connectObject('notify::allocation', queuePopup,
+                'notify::translation-x', queuePopup, 'notify::translation-y', queuePopup, this);
+        }
         this._outsideClick = global.stage.connect('captured-event',
             (_stage, event) => this._onCapturedEvent(event));
         this._windowFocus = global.display.connect('notify::focus-window', () => {
@@ -183,6 +194,11 @@ export default class HarborExtension extends Extension {
 
     disable() {
         global.window_manager.disconnect(this._mapped);
+        Main.layoutManager.disconnectObject(this);
+        global.display.disconnectObject(this);
+        for (const actor of this._panelActors)
+            actor.disconnectObject(this);
+        this._panelActors = null;
         global.stage.disconnect(this._outsideClick);
         global.display.disconnect(this._windowFocus);
         global.stage.disconnect(this._menuFocus);
@@ -224,7 +240,7 @@ export default class HarborExtension extends Extension {
     _present(win) {
         this._popup = win;
         this._button?.setPopupOpen(true);
-        this._place(win);
+        this._queuePlace(win);
         this._blur.setWindow(win);
         this._trackMenuHover();
         if (!win.has_focus())
@@ -234,12 +250,8 @@ export default class HarborExtension extends Extension {
     _untrack(win) {
         const {ids, pending} = this._tracked.get(win);
         this._tracked.delete(win);
-        if (pending) {
-            if (this._laters)
-                this._laters.remove(pending);
-            else
-                Meta.later_remove(pending);
-        }
+        if (pending)
+            global.stage.disconnect(pending);
         for (const id of ids)
             win.disconnect(id);
         if (this._popup === win) {
@@ -252,19 +264,18 @@ export default class HarborExtension extends Extension {
 
     _queuePlace(win) {
         const state = this._tracked.get(win);
-        if (state.pending || !win.get_compositor_private()?.visible)
+        const actor = win.get_compositor_private();
+        if (state.pending || !actor?.visible)
             return;
-        // A resize or a window-placement extension can move the window after
-        // map. Re-pin it before the next frame without re-entering move_frame.
-        const place = () => {
-            if (win.get_compositor_private()?.visible)
+        // Monitor events publish the new layout before Clutter allocates the
+        // panel and button. Read their positions after layout, before painting.
+        state.pending = global.stage.connect('before-paint', () => {
+            global.stage.disconnect(state.pending);
+            if (actor.visible)
                 this._place(win);
             state.pending = 0;
-            return GLib.SOURCE_REMOVE;
-        };
-        state.pending = this._laters
-            ? this._laters.add(Meta.LaterType.BEFORE_REDRAW, place)
-            : Meta.later_add(Meta.LaterType.BEFORE_REDRAW, place);
+        });
+        actor.queue_redraw();
     }
 
     _hide() {
@@ -338,8 +349,16 @@ export default class HarborExtension extends Extension {
         const [buttonWidth] = this._button.get_transformed_size();
         const [, panelY] = Main.panel.get_transformed_position();
         const [, panelHeight] = Main.panel.get_transformed_size();
-        const monitor = Main.layoutManager.findIndexForActor(this._button);
-        const area = Main.layoutManager.getWorkAreaForMonitor(monitor);
+        const monitor = Main.layoutManager.findMonitorForActor(this._button);
+        if (!monitor)
+            return;
+        const area = Main.layoutManager.getWorkAreaForMonitor(monitor.index);
+        if (area.height > 0 && area.height !== this._panelWorkHeight) {
+            this._panelWorkHeight = area.height;
+            Gio.DBus.session.call(BUS_NAME, OBJECT_PATH, INTERFACE, 'SetPanelWorkHeight',
+                new GLib.Variant('(u)', [area.height]), null,
+                Gio.DBusCallFlags.NO_AUTO_START, -1, null, null);
+        }
         const frame = win.get_frame_rect();
         const {dateMenu, quickSettings} = Main.panel.statusArea;
         const menu = dateMenu?.menu?.actor ?? quickSettings?.menu?.actor;

@@ -26,7 +26,7 @@ use wayland_protocols_plasma::contrast::client::{
     org_kde_kwin_contrast_manager::OrgKdeKwinContrastManager,
 };
 
-use crate::popup::{set_blur_palette, BlurPalette};
+use crate::popup::{set_blur_palette, BlurPalette, ColorScheme, MenuColors};
 
 // Match the inset and radius of #app in styles.css.
 const INSET: i32 = 7;
@@ -68,6 +68,26 @@ pub(super) fn install(app: &AppHandle, window: &gtk::ApplicationWindow) {
             effect.resize(allocation.width(), allocation.height());
         }
     });
+    let monitors: Vec<_> = ["kdeglobals", "plasmarc", "kwinrc"].into_iter().filter_map(|name| {
+        let file = gio::File::for_path(glib::user_config_dir().join(name));
+        let monitor = file.monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE).ok()?;
+        let effect = effect.clone();
+        let handle = app.clone();
+        monitor.connect_changed(move |_, _, _, event| {
+            if effect.borrow().is_some() && matches!(event,
+                gio::FileMonitorEvent::ChangesDoneHint | gio::FileMonitorEvent::MovedIn |
+                gio::FileMonitorEvent::Renamed | gio::FileMonitorEvent::Deleted)
+            {
+                set_blur_palette(&handle, plasma_appearance().map(|(palette, _)| palette));
+            }
+        });
+        Some(monitor)
+    }).collect();
+    window.connect_destroy(move |_| {
+        for monitor in &monitors {
+            monitor.cancel();
+        }
+    });
     let handle = app.clone();
     window.connect_unmap(move |_| {
         if effect.borrow_mut().take().is_some() {
@@ -77,8 +97,22 @@ pub(super) fn install(app: &AppHandle, window: &gtk::ApplicationWindow) {
 }
 
 fn key_file(path: &Path) -> Option<glib::KeyFile> {
+    parse_kconfig(&std::fs::read_to_string(path).ok()?)
+}
+
+fn parse_kconfig(data: &str) -> Option<glib::KeyFile> {
+    // KConfig's nested groups are not valid GKeyFile group names.
+    let mut normalized = String::with_capacity(data.len());
+    for line in data.lines() {
+        if line.trim_start().starts_with('[') && line.contains("][") {
+            normalized.push_str(&line.replace("][", "/"));
+        } else {
+            normalized.push_str(line);
+        }
+        normalized.push('\n');
+    }
     let file = glib::KeyFile::new();
-    file.load_from_file(path, glib::KeyFileFlags::NONE).ok()?;
+    file.load_from_data(&normalized, glib::KeyFileFlags::NONE).ok()?;
     Some(file)
 }
 
@@ -105,6 +139,46 @@ fn theme_dir(name: &str) -> Option<PathBuf> {
 fn color(value: &str) -> Option<[u8; 3]> {
     let mut channels = value.split(',').map(|channel| channel.trim().parse().ok());
     Some([channels.next()??, channels.next()??, channels.next()??])
+}
+
+fn color_scheme(name: &str) -> Option<glib::KeyFile> {
+    if Path::new(name).file_name().and_then(|name| name.to_str()) != Some(name) {
+        return None;
+    }
+    let filename = format!("{}.colors", name.replace(' ', ""));
+    std::iter::once(glib::user_data_dir())
+        .chain(glib::system_data_dirs())
+        .find_map(|dir| key_file(&dir.join("color-schemes").join(&filename)))
+}
+
+fn look_and_feel_scheme(package: &str) -> Option<String> {
+    if Path::new(package).file_name().and_then(|name| name.to_str()) != Some(package) {
+        return None;
+    }
+    let defaults = std::iter::once(glib::user_data_dir())
+        .chain(glib::system_data_dirs())
+        .find_map(|dir| key_file(&dir.join("plasma/look-and-feel").join(package)
+            .join("contents/defaults")))?;
+    defaults.string("kdeglobals/General", "ColorScheme").ok().map(Into::into)
+}
+
+fn alternate_colors(current: ColorScheme, panel_alpha: u8, bar_alpha: u8) -> Option<MenuColors> {
+    let (key, default) = match current {
+        ColorScheme::Light => ("DefaultDarkLookAndFeel", "BreezeDark"),
+        ColorScheme::Dark => ("DefaultLightLookAndFeel", "BreezeLight"),
+    };
+    let name = match setting("kdeglobals", "KDE", key) {
+        Some(package) => look_and_feel_scheme(&package)?,
+        None => default.to_owned(),
+    };
+    let scheme = color_scheme(&name)?;
+    let role = |group, key| color(&scheme.string(group, key).ok()?);
+    let [r, g, b] = role("Colors:Window", "BackgroundNormal")?;
+    let panel = [r, g, b, panel_alpha];
+    let [r, g, b] = role("Colors:Header", "BackgroundNormal").unwrap_or([r, g, b]);
+    let bar = [r, g, b, bar_alpha];
+    let text = role("Colors:Window", "ForegroundNormal").map(|[r, g, b]| [r, g, b, 255]);
+    Some(MenuColors { panel, bar, text })
 }
 
 fn plasma_appearance() -> Option<(BlurPalette, Option<[f64; 3]>)> {
@@ -136,15 +210,7 @@ fn plasma_appearance() -> Option<(BlurPalette, Option<[f64; 3]>)> {
         .find(|path| path.is_file())?;
     let colors = key_file(&theme.join("colors"));
     let scheme = setting("kdeglobals", "General", "ColorScheme")
-        .filter(|name| {
-            Path::new(name).file_name().and_then(|name| name.to_str()) == Some(name.as_str())
-        })
-        .and_then(|name| {
-            let filename = format!("{}.colors", name.replace(' ', ""));
-            std::iter::once(glib::user_data_dir())
-                .chain(glib::system_data_dirs())
-                .find_map(|dir| key_file(&dir.join("color-schemes").join(&filename)))
-        });
+        .and_then(|name| color_scheme(&name));
     let lookup = |group, key| {
         colors
             .as_ref()
@@ -158,6 +224,12 @@ fn plasma_appearance() -> Option<(BlurPalette, Option<[f64; 3]>)> {
     let bar = role("Colors:Header").map_or(panel, |[r, g, b]| [r, g, b, panel[3]]);
     // The user's colour scheme text colour, like the GNOME path's theme foreground.
     let text = lookup("Colors:Window", "ForegroundNormal").map(|[r, g, b]| [r, g, b, 255]);
+    let desktop_background = setting("kdeglobals", "Colors:Window", "BackgroundNormal")
+        .or_else(|| scheme.as_ref()?.string("Colors:Window", "BackgroundNormal").ok().map(Into::into))
+        .and_then(|value| color(&value))
+        .unwrap_or([panel[0], panel[1], panel[2]]);
+    let [r, g, b] = desktop_background.map(u32::from);
+    let scheme = if 299 * r + 587 * g + 114 * b < 128_000 { ColorScheme::Dark } else { ColorScheme::Light };
     let contrast = settings.as_ref().and_then(|file| {
         let group = "ContrastEffect";
         if !file.boolean(group, "enabled").unwrap_or(false)
@@ -172,7 +244,13 @@ fn plasma_appearance() -> Option<(BlurPalette, Option<[f64; 3]>)> {
             .all(|value| value.is_finite() && (0.0..=10.0).contains(value))
             .then_some(values)
     });
-    Some((BlurPalette { panel, bar, text, corner_radius: None }, contrast))
+    let alternate = alternate_colors(scheme, panel[3], bar[3]);
+    Some((BlurPalette {
+        current: MenuColors { panel, bar, text },
+        alternate,
+        scheme: Some(scheme),
+        corner_radius: None,
+    }, contrast))
 }
 
 fn dialog_color(path: &Path, theme_color: Option<[u8; 3]>) -> Option<[u8; 4]> {
@@ -415,5 +493,22 @@ impl Drop for SurfaceBlur {
         if let Some(contrast) = &self.contrast {
             contrast.release();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_kconfig;
+
+    #[test]
+    fn reads_kde_schemes_with_nested_groups() {
+        let file = parse_kconfig(
+            "[kdeglobals][General]\nColorScheme=BreezeDark\n\
+             [Colors:Header]\nBackgroundNormal=40,41,42\n\
+             [Colors:Header][Inactive]\nBackgroundNormal=50,51,52\n",
+        ).unwrap();
+        assert_eq!(file.string("kdeglobals/General", "ColorScheme").unwrap(), "BreezeDark");
+        assert_eq!(file.string("Colors:Header", "BackgroundNormal").unwrap(), "40,41,42");
+        assert_eq!(file.string("Colors:Header/Inactive", "BackgroundNormal").unwrap(), "50,51,52");
     }
 }

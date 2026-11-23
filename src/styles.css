@@ -3,11 +3,15 @@
   --font-ui: system-ui, sans-serif;
   --font-mono: monospace;
   /* Default tint for desktops without configured blur. */
-  --panel-top: rgba(250, 250, 252, .97);
+  --panel-rgb: 250 250 252;
+  --bar-rgb: 244 245 248;
+  --panel-top: rgb(var(--panel-rgb) / .97);
   --panel-bottom: rgba(244, 245, 248, .97);
-  --bar: #f4f5f8;
-  --text: #22242a;
-  --muted: #464a55;
+  --bar: rgb(var(--bar-rgb));
+  --theme-text: #22242a;
+  --theme-muted: #464a55;
+  --text: var(--theme-text);
+  --muted: var(--theme-muted);
   --line: rgba(30, 36, 48, .13);
   --edge: rgba(30, 36, 48, .19);
   --hover: rgba(20, 30, 50, .07);
@@ -25,14 +29,21 @@
   --card-radius: 13px;
 }
 
-[data-theme="dark"] {
+:root:where(
+  [data-theme-mode="dark"],
+  [data-theme-mode="system"][data-palette-scheme="dark"],
+  [data-theme-mode="system"]:not([data-palette-scheme])[data-system-theme="dark"]
+) {
   color-scheme: dark;
   /* Less backdrop contrast is needed against the darker tint. */
-  --panel-top: rgba(36, 36, 40, .98);
+  --panel-rgb: 36 36 40;
+  --bar-rgb: 35 35 39;
+  --panel-top: rgb(var(--panel-rgb) / .98);
   --panel-bottom: rgba(30, 30, 33, .98);
-  --bar: #232327;
-  --text: #f0f1f4;
-  --muted: #c3c5cf;
+  --theme-text: #f0f1f4;
+  --theme-muted: #c3c5cf;
+  --menu-fallback-text: #f6f6f7;
+  --menu-fallback-muted: color-mix(in srgb, var(--text) 74%, #7c7c80);
   --line: rgba(255, 255, 255, .10);
   --edge: rgba(255, 255, 255, .16);
   --hover: rgba(255, 255, 255, .07);
@@ -44,6 +55,26 @@
   --green: #79d8a2;
   --amber: #edba69;
   --red: #ff8797;
+}
+
+[data-system-blur] {
+  --panel-top: var(--alt-panel, rgb(var(--panel-rgb) / var(--sys-panel-alpha)));
+  --bar: var(--alt-bar, rgb(var(--bar-rgb) / var(--sys-bar-alpha)));
+  --text: var(--alt-text, var(--theme-text));
+  --muted: var(--alt-muted, var(--theme-muted));
+}
+
+[data-system-blur]:is(
+  [data-theme-mode="system"],
+  [data-theme-mode="light"][data-palette-scheme="light"],
+  [data-theme-mode="dark"][data-palette-scheme="dark"],
+  [data-theme-mode="light"]:not([data-palette-scheme])[data-system-theme="light"],
+  [data-theme-mode="dark"]:not([data-palette-scheme])[data-system-theme="dark"]
+) {
+  --panel-top: var(--sys-panel);
+  --bar: var(--sys-bar);
+  --text: var(--sys-text, var(--menu-fallback-text, var(--theme-text)));
+  --muted: var(--sys-muted, var(--menu-fallback-muted, var(--theme-muted)));
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -389,16 +420,6 @@ svg {
 .settings-note { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
 .pill-button { padding: 0 9px; text-align: center; }
 .pill-button:disabled { cursor: default; opacity: .6; }
-
-/* Following the desktop's (translucent) menu tint: use panel-menu text colours —
-   white primary and soft light-grey secondary — like the other GNOME menus. */
-[data-theme="dark"][data-system-blur] {
-  --text: #f6f6f7;
-  /* Solid, not alpha: translucent text lets the background bleed through the
-     glyphs and looks thin on a see-through panel. */
-  --muted: color-mix(in srgb, var(--text) 74%, #7c7c80);
-  --line: rgba(255, 255, 255, .10);
-}
 
 /* Settings controls read as text on the panel, not boxes: value + chevron,
    highlighted only on hover/focus. */

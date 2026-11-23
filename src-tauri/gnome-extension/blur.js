@@ -13,31 +13,98 @@ const APPLIED = 'bms-popup-blurred';
 const SECTIONS = ['quick-settings-grid', 'datemenu-calendar-column'];
 const DEFAULT_RADIUS = 13; // Matches --card-radius in styles.css.
 
-function background(actor) {
+function themeNode(actor) {
     actor.ensure_style();
-    const {red, green, blue, alpha} = actor.get_theme_node().get_background_color();
+    return actor.get_theme_node();
+}
+
+function rgba({red, green, blue, alpha}) {
     return [red, green, blue, alpha];
 }
 
-// The menu's text colour from the live theme, so harbor matches any shell theme.
-function foreground(actor) {
-    actor.ensure_style();
-    const {red, green, blue, alpha} = actor.get_theme_node().get_foreground_color();
-    return [red, green, blue, alpha];
-}
-
-function sectionBackground(actor) {
+function sectionBackground(actor, nodeFor) {
     for (const child of actor.get_children()) {
         if (child instanceof St.Widget && SECTIONS.some(name => child.has_style_class_name(name))) {
-            const color = background(child);
+            const color = rgba(nodeFor(child).get_background_color());
             if (color[3])
                 return color;
         }
-        const color = sectionBackground(child);
+        const color = sectionBackground(child, nodeFor);
         if (color)
             return color;
     }
     return null;
+}
+
+function menuColors(menu, nodeFor = themeNode) {
+    const node = nodeFor(menu);
+    const panel = rgba(node.get_background_color());
+    return [...panel, ...(sectionBackground(menu, nodeFor) ?? panel), ...rgba(node.get_foreground_color())];
+}
+
+function stylesheetScheme(file) {
+    const name = file?.get_basename();
+    const explicit = name?.match(/-(light|dark)\.css$/)?.[1];
+    if (explicit)
+        return explicit;
+    if (name === 'gnome-shell.css') {
+        const directory = file.get_parent()?.get_basename();
+        if (directory === 'Yaru' || directory === 'Yaru-dark')
+            return directory === 'Yaru' ? 'light' : 'dark';
+    }
+    return null;
+}
+
+function pairedStylesheet(file, scheme) {
+    const parent = file?.get_parent();
+    if (!parent)
+        return null;
+    const name = file.get_basename();
+    const sibling = parent.get_child(name.replace(/(?:-(?:light|dark))?\.css$/, `-${scheme}.css`));
+    if (!sibling.equal(file) && sibling.query_exists(null))
+        return sibling;
+
+    // Ubuntu's bundled Yaru light stylesheet is named gnome-shell.css.
+    const directory = parent.get_basename();
+    if (name.startsWith('gnome-shell') && ['Yaru', 'Yaru-dark'].includes(directory)) {
+        const bundledLight = parent.get_child('gnome-shell.css');
+        if (scheme === 'light' && directory === 'Yaru' && bundledLight.query_exists(null))
+            return bundledLight;
+        const legacy = Gio.File.new_for_path(GLib.build_filenamev([
+            global.datadir, 'theme', scheme === 'light' ? 'Yaru' : 'Yaru-dark', 'gnome-shell.css',
+        ]));
+        if (legacy.query_exists(null))
+            return legacy;
+    }
+    return null;
+}
+
+function otherTheme(live, scheme, bms) {
+    const application = pairedStylesheet(live.application_stylesheet, scheme);
+    if (live.application_stylesheet && !application)
+        return null;
+    const defaults = pairedStylesheet(live.default_stylesheet, scheme)
+        ?? (application ? live.default_stylesheet : null);
+    if (!defaults)
+        return null;
+    const theme = new St.Theme({application_stylesheet: application, default_stylesheet: defaults});
+    if (bms)
+        theme.load_stylesheet(pairedStylesheet(bms, scheme) ?? bms);
+    return theme;
+}
+
+function alternateNode(context, theme, scheme, adaptive, node, nodes) {
+    if (!node)
+        return null;
+    if (!nodes.has(node)) {
+        const parent = alternateNode(context, theme, scheme, adaptive, node.get_parent(), nodes);
+        const classes = node.get_element_classes()?.map(name => adaptive
+            ? name.replace(/^(bms-popup-(?:background|surface)-)(?:light|dark)$/, `$1${scheme}`)
+            : name).join(' ');
+        nodes.set(node, St.ThemeNode.new(context, parent, theme, node.get_element_type(),
+            node.get_element_id(), classes ?? null, node.get_pseudo_classes()?.join(' ') ?? null, ''));
+    }
+    return nodes.get(node);
 }
 
 export class PanelBlur {
@@ -53,6 +120,8 @@ export class PanelBlur {
             [actor, actor.connect('style-changed', () => this.refresh())]);
         const theme = St.ThemeContext.get_for_stage(global.stage);
         this._signals.push([theme, theme.connect('changed', () => this.refresh())]);
+        const shellSettings = St.Settings.get();
+        this._signals.push([shellSettings, shellSettings.connect('notify::color-scheme', () => this.refresh())]);
         const manager = Main.extensionManager;
         this._signals.push([manager, manager.connect('extension-state-changed', (_manager, extension) => {
             if (extension.uuid === BLUR_UUID)
@@ -65,6 +134,7 @@ export class PanelBlur {
         if (this._settings)
             this._settings.disconnect(this._settingsId);
         this._settings = null;
+        this._alternate = null;
         this._extension = Main.extensionManager.lookup(BLUR_UUID);
         const extension = this._extension;
         if (extension?.state === (ExtensionState.ACTIVE ?? ExtensionState.ENABLED)) {
@@ -176,14 +246,47 @@ export class PanelBlur {
             effect.brightness = settings.get_double('brightness');
         }
         const active = !nativePipeline || this._target.has_style_class_name(APPLIED);
-        const panel = active ? background(menu) : [];
-        this._send(active, active ? [...panel, ...(sectionBackground(menu) ?? panel), ...foreground(menu)] : [], radius);
+        if (active)
+            this._send(true, this._palettes(menu, settings, radius), radius);
+        else
+            this._send(false, []);
+    }
+
+    _palettes(menu, settings, radius) {
+        const context = St.ThemeContext.get_for_stage(global.stage);
+        const live = context.get_theme();
+        const variant = stylesheetScheme(live.application_stylesheet ?? live.default_stylesheet)
+            ?? Main.getStyleVariant?.();
+        const dark = ['light', 'dark'].includes(variant) ? variant === 'dark'
+            : St.Settings.get().color_scheme === St.SystemColorScheme.PREFER_DARK;
+        const current = [Number(dark), radius, ...menuColors(menu)];
+        const other = dark ? 'light' : 'dark';
+        const stylesheet = this._extension.stylesheet;
+        const cached = this._alternate;
+        if (cached?.live !== live || cached.scheme !== other || cached.stylesheet !== stylesheet) {
+            let theme = null;
+            try {
+                theme = otherTheme(live, other, stylesheet);
+            } catch (error) {
+                console.warn(`harbor: alternate shell theme unavailable: ${error.message}`);
+            }
+            this._alternate = {live, scheme: other, stylesheet, theme};
+        }
+        const {theme} = this._alternate;
+        if (!theme)
+            return current;
+
+        // BMS's automatic override keeps the same popup selectors but changes
+        // the light/dark classes on their ancestors. Fixed overrides stay fixed.
+        const adaptive = settings.settings_schema.has_key('style-popup')
+            && ![0, 1, 2].includes(settings.get_int('style-popup'));
+        const nodes = new Map();
+        const nodeFor = actor => alternateNode(context, theme, other, adaptive, themeNode(actor), nodes);
+        return [...current, ...menuColors(menu, nodeFor)];
     }
 
     _send(active, colors, radius) {
-        this._radius = colors.length ? radius : null;
-        if (this._radius !== null)
-            colors.push(this._radius);
+        this._radius = radius ?? null;
         const key = [active, ...colors].join();
         if (this._last === key)
             return;

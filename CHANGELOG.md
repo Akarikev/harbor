@@ -30,7 +30,6 @@ All notable changes to harbor are documented in this file.
 
 ### Known issues
 
-- Hover switching between harbor and other GNOME panel menus may not work in every session.
 - KDE, Xfce and wlroots desktops are code-reviewed but not yet tested live; see `TESTING.md`.
 
 ## [0.2.0]

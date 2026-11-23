@@ -31,11 +31,23 @@ struct PopupPlacement {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct BlurPalette {
+    pub current: MenuColors,
+    pub alternate: Option<MenuColors>,
+    pub scheme: Option<ColorScheme>,
+    pub corner_radius: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ColorScheme {
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MenuColors {
     pub panel: [u8; 4],
     pub bar: [u8; 4],
-    /// The shell theme's menu text colour, when the extension provides it.
     pub text: Option<[u8; 4]>,
-    pub corner_radius: Option<u8>,
 }
 
 #[derive(Default)]
@@ -45,6 +57,8 @@ struct PopupLifecycle {
     destroying: bool,
     ready: bool,
     pending_show: Option<PopupRequest>,
+    requested_height: Option<u32>,
+    panel_work_height: Option<u32>,
 }
 
 struct PopupRequest {
@@ -102,21 +116,29 @@ pub(super) fn setup(app: &AppHandle, mode: PlacementMode) {
 
 fn blur_script(palette: Option<BlurPalette>) -> String {
     let blurred = palette.is_some();
+    let scheme = match palette.and_then(|palette| palette.scheme) {
+        Some(ColorScheme::Light) => "light",
+        Some(ColorScheme::Dark) => "dark",
+        None => "",
+    };
     let radius = palette
         .and_then(|palette| palette.corner_radius)
         .map_or_else(String::new, |radius| format!("{radius}px"));
-    let (panel, bar) = palette.map_or_else(
+    let rgba = |color: Option<[u8; 4]>| color.map_or_else(
         || (String::new(), String::new()),
-        |palette| {
-            // Use the desktop's menu tint as-is so harbor looks like the other panel
-            // menus; readability comes from menu-style light text (styles.css).
-            let rgba = |[r, g, b, a]: [u8; 4]| format!("rgba({r},{g},{b},{})", f64::from(a) / 255.0);
-            (rgba(palette.panel), rgba(palette.bar))
+        |[r, g, b, a]| {
+            let alpha = f64::from(a) / 255.0;
+            (format!("rgba({r},{g},{b},{alpha})"), alpha.to_string())
         },
     );
+    let (panel, panel_alpha) = rgba(palette.map(|palette| palette.current.panel));
+    let (bar, bar_alpha) = rgba(palette.map(|palette| palette.current.bar));
+    let alternate = palette.and_then(|palette| palette.alternate);
+    let (alt_panel, _) = rgba(alternate.map(|colors| colors.panel));
+    let (alt_bar, _) = rgba(alternate.map(|colors| colors.bar));
     // Opaque text in the theme's colour; secondary text is a solid mix of it
     // (not alpha, which lets the background bleed through the glyphs).
-    let (text, muted) = palette.and_then(|palette| palette.text).map_or_else(
+    let foreground = |text: Option<[u8; 4]>| text.map_or_else(
         || (String::new(), String::new()),
         |[r, g, b, _]| {
             let text = format!("rgb({r},{g},{b})");
@@ -124,17 +146,27 @@ fn blur_script(palette: Option<BlurPalette>) -> String {
             (text, muted)
         },
     );
+    let (text, muted) = foreground(palette.and_then(|palette| palette.current.text));
+    let (alt_text, alt_muted) = foreground(alternate.and_then(|colors| colors.text));
     format!(r#"(() => {{
         const apply = () => {{
             const root = document.documentElement;
             const style = root.style;
             root.toggleAttribute('data-system-blur', {blurred});
-            style.setProperty('--panel-top', '{panel}');
-            style.setProperty('--panel-bottom', '{panel}');
-            style.setProperty('--bar', '{bar}');
+            const scheme = '{scheme}';
+            if (scheme) root.dataset.paletteScheme = scheme;
+            else delete root.dataset.paletteScheme;
+            style.setProperty('--sys-panel', '{panel}');
+            style.setProperty('--sys-panel-alpha', '{panel_alpha}');
+            style.setProperty('--sys-bar', '{bar}');
+            style.setProperty('--sys-bar-alpha', '{bar_alpha}');
             style.setProperty('--card-radius', '{radius}');
-            style.setProperty('--text', '{text}');
-            style.setProperty('--muted', '{muted}');
+            style.setProperty('--sys-text', '{text}');
+            style.setProperty('--sys-muted', '{muted}');
+            style.setProperty('--alt-panel', '{alt_panel}');
+            style.setProperty('--alt-bar', '{alt_bar}');
+            style.setProperty('--alt-text', '{alt_text}');
+            style.setProperty('--alt-muted', '{alt_muted}');
         }};
         if (document.documentElement) apply();
         else document.addEventListener('DOMContentLoaded', apply, {{ once: true }});
@@ -184,15 +216,21 @@ fn font_script() -> String {
 #[tauri::command]
 pub(super) fn resize_popup(window: WebviewWindow, height: u32) -> Result<(), String> {
     let gtk_window = window.gtk_window().map_err(|err| err.to_string())?;
-    let display = gtk_window.display();
-    let monitor = gtk_window
-        .window()
-        .and_then(|native| display.monitor_at_window(&native))
-        .or_else(|| display.primary_monitor());
-    let limit = monitor.map_or(560, |monitor| {
-        let work_height = monitor.workarea().height().max(1) as u32;
-        (work_height * 7 / 10).clamp(1, 560)
+    let state = window.state::<PopupPlacement>();
+    let panel_work_height = {
+        let mut lifecycle = state.lifecycle();
+        lifecycle.requested_height = Some(height);
+        lifecycle.panel_work_height
+    };
+    let work_height = panel_work_height.or_else(|| {
+        let display = gtk_window.display();
+        gtk_window
+            .window()
+            .and_then(|native| display.monitor_at_window(&native))
+            .or_else(|| display.primary_monitor())
+            .map(|monitor| monitor.workarea().height().max(1) as u32)
     });
+    let limit = work_height.map_or(560, |height| (height.saturating_mul(7) / 10).clamp(1, 560));
     let height = height.clamp(1, limit);
     if gtk_window.size().1 != height as i32 {
         window
@@ -200,6 +238,24 @@ pub(super) fn resize_popup(window: WebviewWindow, height: u32) -> Result<(), Str
             .map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+pub(super) fn set_panel_work_height(app: &AppHandle, height: Option<u32>) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let state = handle.state::<PopupPlacement>();
+        let requested_height = {
+            let mut lifecycle = state.lifecycle();
+            if lifecycle.panel_work_height == height {
+                return;
+            }
+            lifecycle.panel_work_height = height;
+            lifecycle.requested_height
+        };
+        if let Some((window, requested_height)) = handle.get_webview_window("main").zip(requested_height) {
+            let _ = resize_popup(window, requested_height);
+        }
+    });
 }
 
 impl PopupLifecycle {
@@ -347,6 +403,7 @@ pub(super) fn on_destroyed(app: &AppHandle) {
         let mut lifecycle = state.lifecycle();
         lifecycle.cancel_idle();
         lifecycle.ready = false;
+        lifecycle.requested_height = None;
         (std::mem::take(&mut lifecycle.destroying), lifecycle.pending_show.take())
     };
     if destroyed_after_idle {

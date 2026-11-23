@@ -580,8 +580,9 @@ function setShowAll(enabled) {
 }
 
 function applyTheme() {
-  const theme = themeSelect.value;
-  document.documentElement.dataset.theme = theme === 'system' ? (systemTheme.matches ? 'dark' : 'light') : theme;
+  const { dataset } = document.documentElement;
+  dataset.themeMode = themeSelect.value;
+  dataset.systemTheme = systemTheme.matches ? 'dark' : 'light';
 }
 
 for (const toggle of [showAllToggle, showAllSettings]) {
