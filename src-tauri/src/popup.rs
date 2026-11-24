@@ -5,9 +5,49 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, LogicalSize, Manager, PhysicalPosition, PhysicalRect, WebviewWindow, WebviewWindowBuilder};
+use tauri::{AppHandle, EventLoopMessage, LogicalSize, Manager, PhysicalPosition, PhysicalRect, WebviewWindow, WebviewWindowBuilder};
+use tauri_runtime_wry::tao::event::{Event, WindowEvent};
+use tauri_runtime_wry::tao::event_loop::{ControlFlow, EventLoopProxy, EventLoopWindowTarget};
+use tauri_runtime_wry::{Context, EventLoopIterationContext, Message, Plugin, PluginBuilder, WebContextStore};
+use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt as WebKitSettingsExt, WebViewExt};
 
 use crate::append_log;
+
+#[derive(Default)]
+pub(super) struct ReleaseWebContext {
+    window_destroyed: bool,
+}
+
+impl PluginBuilder<EventLoopMessage> for ReleaseWebContext {
+    type Plugin = Self;
+
+    fn build(self, _: Context<EventLoopMessage>) -> Self {
+        self
+    }
+}
+
+impl Plugin<EventLoopMessage> for ReleaseWebContext {
+    fn on_event(
+        &mut self,
+        event: &Event<Message<EventLoopMessage>>,
+        _: &EventLoopWindowTarget<Message<EventLoopMessage>>,
+        _: &EventLoopProxy<Message<EventLoopMessage>>,
+        _: &mut ControlFlow,
+        context: EventLoopIterationContext<'_, EventLoopMessage>,
+        web_context: &WebContextStore,
+    ) -> bool {
+        if matches!(event, Event::WindowEvent { event: WindowEvent::Destroyed, .. }) {
+            self.window_destroyed = true;
+        } else if matches!(event, Event::MainEventsCleared) && std::mem::take(&mut self.window_destroyed)
+            && context.windows.0.borrow().is_empty()
+        {
+            // Wry retains Linux contexts by default. Release after it has removed the
+            // window, including its WebView, so WebKit can close the network process.
+            web_context.lock().unwrap().clear();
+        }
+        false
+    }
+}
 
 const POPUP_WIDTH: f64 = 376.0;
 const MARGIN: i32 = 12;
@@ -310,6 +350,11 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
     gtk_window.connect_unmap(move |_| schedule_idle_destruction(&handle));
     window.with_webview(move |platform| {
         let view = platform.inner();
+        view.connect_destroy(disconnect_webview_ipc);
+        // The desktop compositor handles popup blur independently of WebKit.
+        if let Some(settings) = WebViewExt::settings(&view) {
+            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
+        }
         view.set_property("zoom-level", 1.0_f64);
         #[cfg(not(debug_assertions))]
         view.connect_local("context-menu", false, |_| Some(true.to_value()));
@@ -342,6 +387,28 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
         start.elapsed().as_millis()
     ));
     Ok(window)
+}
+
+fn disconnect_webview_ipc(view: &webkit2gtk::WebView) {
+    use glib::{gobject_ffi, subclass::SignalId, translate::IntoGlib};
+    use std::ptr::null_mut;
+
+    let Some(manager) = view.user_content_manager() else { return };
+    let Some(signal) = SignalId::lookup("script-message-received", manager.type_()) else { return };
+    // shortcut: Wry 0.55's IPC closure holds the view that owns this manager.
+    // Recheck the cycle and signal on Wry upgrades.
+    // SAFETY: GTK emits destroy on the main thread and the manager is borrowed
+    // alive throughout this lookup and disconnect.
+    unsafe {
+        let manager = manager.as_ptr().cast();
+        let handler = gobject_ffi::g_signal_handler_find(
+            manager, gobject_ffi::G_SIGNAL_MATCH_ID, signal.into_glib(), 0,
+            null_mut(), null_mut(), null_mut(),
+        );
+        if handler != 0 {
+            gobject_ffi::g_signal_handler_disconnect(manager, handler);
+        }
+    }
 }
 
 /// The page has rendered its first list at its final height: map the window now.

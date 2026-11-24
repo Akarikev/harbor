@@ -1485,9 +1485,12 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-single-instance",
+ "tauri-runtime-wry",
+ "tokio",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",
+ "webkit2gtk",
  "zbus",
 ]
 

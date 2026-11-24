@@ -2,7 +2,7 @@ use ksni::TrayMethods;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
@@ -707,23 +707,20 @@ fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
 async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
     append_log(&format!(">>> scan_ports called with show_all={show_all}"));
 
-    let (tx, rx) = mpsc::channel();
-    tauri::async_runtime::spawn_blocking(move || {
+    let scan = tauri::async_runtime::spawn_blocking(move || {
         let entries = scan_with_proc(show_all);
         append_log(&format!(">>> scan_with_proc returned {} entries", entries.len()));
         append_log(">>> scan_ports returning to JS");
-        let _ = tx.send(entries);
+        entries
     });
 
-    tauri::async_runtime::spawn_blocking(move || match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(entries) => Ok(entries),
+    match tokio::time::timeout(Duration::from_secs(10), scan).await {
+        Ok(result) => result.map_err(|err| err.to_string()),
         Err(_) => {
             append_log(">>> scan_ports timed out");
             Err("scan timed out after 10 seconds".to_string())
         }
-    })
-    .await
-    .map_err(|err| err.to_string())?
+    }
 }
 
 fn matching_pids(mut requested: Vec<u32>, listening: &[u32]) -> Vec<u32> {
@@ -955,8 +952,15 @@ pub fn run() {
         return;
     }
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("error while starting harbor's async runtime");
+    tauri::async_runtime::set(runtime.handle().clone());
+
     let placement_mode = popup::choose_placement_mode();
-    tauri::Builder::default()
+    let mut app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
             if !args.iter().skip(1).any(|arg| arg == "--hidden") {
                 let token = args
@@ -996,16 +1000,18 @@ pub fn run() {
             autostart::set_autostart
         ])
         .build(context)
-        .expect("error while building harbor")
-        .run(|app, event| match event {
-            tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
-            tauri::RunEvent::WindowEvent {
-                label,
-                event: tauri::WindowEvent::Destroyed,
-                ..
-            } if label == "main" => popup::on_destroyed(app),
-            _ => (),
-        });
+        .expect("error while building harbor");
+    app.wry_plugin(popup::ReleaseWebContext::default());
+    app.run(|app, event| match event {
+        tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if label == "main" => popup::on_destroyed(app),
+        _ => (),
+    });
+    runtime.shutdown_background();
 }
 
 #[cfg(test)]
