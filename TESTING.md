@@ -30,7 +30,7 @@ Each run takes about 10 minutes in a VM.
 5. **Single instance:** launching harbor again (app menu or terminal) opens the existing
    popup; no second tray icon appears.
 6. **No white flash** on first open, and none when reopening after leaving it closed for
-   more than 60 s.
+   more than 5 minutes. On GNOME the popup must not appear in the middle of the screen first.
 7. **Ports:** start `python3 -m http.server 8000`; it appears with uptime, CPU, memory and
    energy. Copy shows a check mark; *Open* opens the browser; kill (×) shows Kill/Force and
    removes the row.

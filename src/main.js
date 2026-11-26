@@ -130,6 +130,14 @@ const viewport = byId('viewport');
 const portList = byId('port-list');
 const portsView = byId('ports-view');
 const settingsView = byId('settings-view');
+// WebKitGTK's software rendering keeps a user-scrolled offset after the content shrinks
+// below it (e.g. Show all turned off at the bottom), leaving the list stuck off-screen.
+const scrollClamp = new ResizeObserver(() => {
+  const max = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+  if (viewport.scrollTop > max) viewport.scrollTop = max;
+});
+scrollClamp.observe(portsView);
+scrollClamp.observe(settingsView);
 const emptyState = byId('empty-state');
 const loadingState = byId('loading-state');
 const settingsBtn = byId('settings-btn');
@@ -676,6 +684,13 @@ async function init() {
   const focused = await appWindow.isFocused();
   if (focusEventCountAtQuery === focusEventCount) handlePopupFocus(focused);
   // Load the list before the window is shown; markFirstContentReady() then maps it.
+  // A recreated popup draws the last scan at once; the scan on focus refreshes it.
+  const cached = await invokeCommand('cached_ports', { showAll: showAllToggle.checked }).catch(() => null);
+  if (cached && !firstContentReady) {
+    ports = cached;
+    render();
+    markFirstContentReady();
+  }
   if (!firstContentReady) refresh();
 }
 
@@ -740,10 +755,10 @@ function showGnomeStatus(status) {
   let note;
   if (status.active) note = 'Active. harbor opens from its own top-bar button.';
   else if (status.user_extensions_disabled) note = 'Extensions are turned off in GNOME. Turn them on in the Extensions app.';
-  else if (status.enabled) note = 'Installed. Log out and back in to finish.';
+  else if (status.enabled && status.installed) note = 'Installed. Log out and back in to finish.';
   else note = 'Opens harbor under its own top-bar button with one click.';
   gnomeStatus.textContent = note;
-  gnomeEnable.hidden = status.enabled || status.active;
+  gnomeEnable.hidden = (status.enabled && status.installed) || status.active;
 }
 
 async function refreshGnomeStatus() {

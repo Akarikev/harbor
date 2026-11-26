@@ -47,6 +47,11 @@ impl HarborService {
         popup::request_hide(&self.app);
     }
 
+    /// The pointer reached the button: load the popup hidden so a click shows it at once.
+    fn prepare(&self) {
+        popup::request_prepare(&self.app);
+    }
+
     async fn set_blur(
         &self,
         active: bool,

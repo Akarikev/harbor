@@ -4,5 +4,5 @@
   "description": "Top-bar button for harbor, the localhost port monitor. Opens harbor's popup under the button.",
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
   "url": "https://github.com/Akarikev/harbor",
-  "version": 6
+  "version": 8
 }

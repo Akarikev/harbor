@@ -711,6 +711,7 @@ async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
         let entries = scan_with_proc(show_all);
         append_log(&format!(">>> scan_with_proc returned {} entries", entries.len()));
         append_log(">>> scan_ports returning to JS");
+        *last_scan() = Some((show_all, entries.clone()));
         entries
     });
 
@@ -721,6 +722,21 @@ async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
             Err("scan timed out after 10 seconds".to_string())
         }
     }
+}
+
+/// The last scan outlives the WebView, so a recreated popup can draw it at once
+/// while its own first scan runs.
+fn last_scan() -> MutexGuard<'static, Option<(bool, Vec<PortEntry>)>> {
+    static LAST_SCAN: Mutex<Option<(bool, Vec<PortEntry>)>> = Mutex::new(None);
+    LAST_SCAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[tauri::command]
+fn cached_ports(show_all: bool) -> Option<Vec<PortEntry>> {
+    last_scan()
+        .as_ref()
+        .filter(|(scanned_all, _)| *scanned_all == show_all)
+        .map(|(_, entries)| entries.clone())
 }
 
 fn matching_pids(mut requested: Vec<u32>, listening: &[u32]) -> Vec<u32> {
@@ -786,9 +802,11 @@ fn signal_processes(killable: Vec<u32>, signal: i32) -> Result<(), String> {
     }
 }
 
+const WEBKIT_SOFTWARE_RENDERING: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
+
 #[tauri::command]
 fn open_in_browser(url: String) -> Result<(), String> {
-    use gtk::{gdk, gio};
+    use gtk::{gdk, gio, gio::prelude::AppLaunchContextExt};
 
     if !is_local_browser_url(&url) {
         return Err("Expected an HTTP loopback URL with a port".into());
@@ -797,6 +815,7 @@ fn open_in_browser(url: String) -> Result<(), String> {
     let context = gdk::Display::default().and_then(|display| display.app_launch_context());
     if let Some(context) = &context {
         context.set_timestamp(gtk::current_event_time());
+        context.unsetenv(WEBKIT_SOFTWARE_RENDERING);
     }
     gio::AppInfo::launch_default_for_uri(&url, context.as_ref()).map_err(|err| err.to_string())
 }
@@ -941,6 +960,8 @@ fn forward_activation_token(identifier: &str, token: &str) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Start WebKit in software mode: switching after view creation can break wheel scrolling.
+    std::env::set_var(WEBKIT_SOFTWARE_RENDERING, "1");
     let context = tauri::generate_context!();
     let startup_token = std::env::var("XDG_ACTIVATION_TOKEN")
         .ok()
@@ -989,6 +1010,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_ports,
+            cached_ports,
             kill_processes,
             open_in_browser,
             quit_app,

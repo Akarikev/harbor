@@ -9,7 +9,7 @@ use tauri::{AppHandle, EventLoopMessage, LogicalSize, Manager, PhysicalPosition,
 use tauri_runtime_wry::tao::event::{Event, WindowEvent};
 use tauri_runtime_wry::tao::event_loop::{ControlFlow, EventLoopProxy, EventLoopWindowTarget};
 use tauri_runtime_wry::{Context, EventLoopIterationContext, Message, Plugin, PluginBuilder, WebContextStore};
-use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt as WebKitSettingsExt, WebViewExt};
+use webkit2gtk::WebViewExt;
 
 use crate::append_log;
 
@@ -51,7 +51,8 @@ impl Plugin<EventLoopMessage> for ReleaseWebContext {
 
 const POPUP_WIDTH: f64 = 376.0;
 const MARGIN: i32 = 12;
-const WEBVIEW_IDLE: Duration = Duration::from_secs(60);
+// Hidden this long, the WebView and its WebKit processes are freed; reopening sooner is instant.
+const WEBVIEW_IDLE: Duration = Duration::from_secs(5 * 60);
 // Fallback only: the page normally reports popup_ready after its first list is
 // rendered and sized. Never leave the popup invisible if that signal is lost.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -351,10 +352,6 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
     window.with_webview(move |platform| {
         let view = platform.inner();
         view.connect_destroy(disconnect_webview_ipc);
-        // The desktop compositor handles popup blur independently of WebKit.
-        if let Some(settings) = WebViewExt::settings(&view) {
-            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
-        }
         view.set_property("zoom-level", 1.0_f64);
         #[cfg(not(debug_assertions))]
         view.connect_local("context-menu", false, |_| Some(true.to_value()));
@@ -524,6 +521,35 @@ pub(super) fn request(app: &AppHandle, activation: Option<(i32, i32)>, token: Op
         }
     }) {
         append_log(&format!(">>> popup dispatch failed: {error}"));
+    }
+}
+
+pub(super) fn request_prepare(app: &AppHandle) {
+    let handle = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || prepare(&handle)) {
+        append_log(&format!(">>> popup prepare dispatch failed: {error}"));
+    }
+}
+
+/// Start the WebView hidden ahead of a likely Show. The idle teardown frees it
+/// again if the popup is not opened.
+fn prepare(app: &AppHandle) {
+    let placement = app.state::<PopupPlacement>();
+    if placement.lifecycle().destroying {
+        return;
+    }
+    match app.get_webview_window("main") {
+        Some(window) => {
+            // Already loaded and hidden: restart the countdown so it survives until the click.
+            if !window.is_visible().unwrap_or(true) {
+                placement.lifecycle().cancel_idle();
+                schedule_idle_destruction(app);
+            }
+        }
+        None => match create_window(app, placement.mode) {
+            Ok(_) => schedule_idle_destruction(app),
+            Err(error) => append_log(&format!(">>> popup prepare failed: {error}")),
+        },
     }
 }
 

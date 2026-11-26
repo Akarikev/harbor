@@ -74,6 +74,14 @@ class HarborButton extends PanelMenu.Button {
                 this.menu.open();
             return true;
         });
+        // Hovering usually precedes a click: let harbor start its WebView now.
+        this.connect('enter-event', () => {
+            if (!this.menu.isOpen) {
+                Gio.DBus.session.call(BUS_NAME, OBJECT_PATH, INTERFACE, 'Prepare',
+                    null, null, Gio.DBusCallFlags.NO_AUTO_START, -1, null, null);
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
     }
 
     setPopupOpen(open) {
@@ -227,8 +235,10 @@ export default class HarborExtension extends Extension {
             return;
         if (!this._tracked.has(win)) {
             const ids = [
-                win.connect('size-changed', () => this._queuePlace(win)),
-                win.connect('position-changed', () => this._queuePlace(win)),
+                // Undo moves by anyone else (e.g. window-restoring extensions) at once:
+                // a correction deferred to the next frame shows the popup misplaced for one frame.
+                win.connect('size-changed', () => this._place(win)),
+                win.connect('position-changed', () => this._place(win)),
                 win.connect('shown', () => this._present(win)),
                 win.connect('unmanaged', () => this._untrack(win)),
             ];
@@ -240,7 +250,8 @@ export default class HarborExtension extends Extension {
     _present(win) {
         this._popup = win;
         this._button?.setPopupOpen(true);
-        this._queuePlace(win);
+        // Place it before its first frame; layout changes re-place it via _queuePlace.
+        this._place(win);
         this._blur.setWindow(win);
         this._trackMenuHover();
         if (!win.has_focus())
