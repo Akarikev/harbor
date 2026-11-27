@@ -1,6 +1,6 @@
 [package]
 name = "harbor"
-version = "0.3.1"
+version = "0.3.2"
 description = "See every dev server running on localhost from your system tray"
 authors = ["Akarikev"]
 license = "MIT"

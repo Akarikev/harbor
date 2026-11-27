@@ -44,12 +44,17 @@ fn exec_command() -> String {
     }
 }
 
-/// Desktop-entry Exec quoting: wrap in double quotes, escape ", `, $ and \.
+/// Desktop-entry Exec quoting: wrap in double quotes and escape ", `, $ and \.
+/// The value is also a string field, unescaped before the quoting is read, so every
+/// backslash is doubled again; % is a field code and is written as %%.
 fn quote(path: &str) -> String {
     let mut quoted = String::from("\"");
     for ch in path.chars() {
-        if matches!(ch, '"' | '`' | '$' | '\\') {
-            quoted.push('\\');
+        match ch {
+            '"' | '`' | '$' => quoted.push_str("\\\\"),
+            '\\' => quoted.push_str("\\\\\\"),
+            '%' => quoted.push('%'),
+            _ => {}
         }
         quoted.push(ch);
     }
@@ -105,6 +110,7 @@ mod tests {
     #[test]
     fn quotes_exec_paths_per_desktop_entry_spec() {
         assert_eq!(quote("/home/a b/harbor.AppImage"), "\"/home/a b/harbor.AppImage\"");
-        assert_eq!(quote("/tmp/$x\"y`z\\"), "\"/tmp/\\$x\\\"y\\`z\\\\\"");
+        // Written form of the spec example: string escapes on top of Exec quoting.
+        assert_eq!(quote("/tmp/$x\"y`z\\%"), r#""/tmp/\\$x\\"y\\`z\\\\%%""#);
     }
 }

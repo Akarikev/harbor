@@ -194,11 +194,7 @@ fn resolve_display_name(pid: u32, cmdline: &str) -> String {
 
 fn get_cmdline(pid: u32) -> String {
     let raw = fs::read(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
-    let s: String = raw
-        .iter()
-        .map(|&b| if b == 0 { ' ' } else { b as char })
-        .collect();
-    let trimmed = s.trim().to_string();
+    let trimmed = String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string();
     if !trimmed.is_empty() {
         return trimmed;
     }
@@ -232,8 +228,11 @@ fn parse_process_uid(status: &str) -> Option<u32> {
         .and_then(|value| value.parse().ok())
 }
 
-fn is_known_system_process(name: &str, cmdline: &str, exe: &str) -> bool {
-    let hay = format!("{name} {cmdline} {exe}").to_lowercase();
+/// Matches program names only: markers in arguments or paths (e.g. a project in
+/// ~/code/issue-tracker-api) must not make a dev server unkillable.
+fn is_known_system_process(comm: &str, cmdline: &str, exe: &str) -> bool {
+    let argv0 = cmdline.split_whitespace().next().unwrap_or_default();
+    let hay = format!("{comm} {} {}", basename_from_path(argv0), basename_from_path(exe)).to_lowercase();
     const MARKERS: &[&str] = &[
         "ulauncher",
         "gnome-shell",
@@ -279,17 +278,16 @@ fn compute_is_protected(pid: u32, uid: u32, euid: u32, is_system: bool) -> bool 
     pid == 0 || is_system || uid != euid
 }
 
-fn is_process_protected(pid: u32, uid: u32, name: &str, cmdline: &str) -> bool {
-    let is_system = pid != 0 && is_known_system_process(name, cmdline, &get_process_exe(pid));
+fn is_process_protected(pid: u32, uid: u32, cmdline: &str) -> bool {
+    let is_system =
+        pid != 0 && is_known_system_process(&get_process_name(pid), cmdline, &get_process_exe(pid));
     compute_is_protected(pid, uid, current_euid(), is_system)
 }
 
 fn is_pid_protected(pid: u32) -> bool {
     let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     let uid = parse_process_uid(&status).unwrap_or_else(current_euid);
-    let cmdline = get_cmdline(pid);
-    let name = resolve_display_name(pid, &cmdline);
-    is_process_protected(pid, uid, &name, &cmdline)
+    is_process_protected(pid, uid, &get_cmdline(pid))
 }
 
 fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) -> PortEntry {
@@ -317,7 +315,7 @@ fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) ->
         )
     };
     let process_name = resolve_display_name(pid, &cmdline);
-    let is_protected = is_process_protected(pid, uid, &process_name, &cmdline);
+    let is_protected = is_process_protected(pid, uid, &cmdline);
 
     PortEntry {
         port: socket.port,
@@ -357,15 +355,20 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), String> {
     ))
 }
 
+/// Children of every thread: runtimes like Go and Java spawn from non-main threads.
 fn get_child_pids(pid: u32) -> Vec<u32> {
-    let children_path = format!("/proc/{}/task/{}/children", pid, pid);
-    let Ok(content) = fs::read_to_string(children_path) else {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
         return Vec::new();
     };
-
-    content
-        .split_whitespace()
-        .filter_map(|value| value.parse::<u32>().ok())
+    tasks
+        .flatten()
+        .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|content| {
+            content
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -388,11 +391,12 @@ fn kill_process_tree(pid: u32, signal: i32) -> Result<(), String> {
         }
     }
 
-    for current in ordered.iter().rev().copied() {
-        let _ = send_signal(current, signal);
+    // Parent first, so a supervisor can't respawn workers between the signals.
+    let root = send_signal(pid, signal);
+    for child in ordered.into_iter().skip(1) {
+        let _ = send_signal(child, signal);
     }
-
-    send_signal(pid, signal)
+    root
 }
 
 fn num_cpus() -> f32 {
@@ -961,11 +965,16 @@ fn forward_activation_token(identifier: &str, token: &str) -> bool {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Start WebKit in software mode: switching after view creation can break wheel scrolling.
-    std::env::set_var(WEBKIT_SOFTWARE_RENDERING, "1");
+    // A value the user set (e.g. 0 to force GPU rendering) is kept.
+    if std::env::var_os(WEBKIT_SOFTWARE_RENDERING).is_none() {
+        std::env::set_var(WEBKIT_SOFTWARE_RENDERING, "1");
+    }
     let context = tauri::generate_context!();
-    let startup_token = std::env::var("XDG_ACTIVATION_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty());
+    // Wayland activation token, or the X11 startup-notification id: the window
+    // that consumes it gets focus and ends the launcher's busy cursor.
+    let startup_token = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|token| !token.is_empty()));
     if startup_token
         .as_deref()
         .is_some_and(|token| forward_activation_token(&context.config().identifier, token))
@@ -1042,6 +1051,18 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn system_markers_match_program_names_not_paths() {
+        assert!(is_known_system_process("gsd-xsettings", "/usr/libexec/gsd-xsettings", "/usr/libexec/gsd-xsettings"));
+        assert!(is_known_system_process("tracker-miner-f", "", "/usr/libexec/tracker-miner-fs-3"));
+        assert!(!is_known_system_process(
+            "node",
+            "node /home/u/code/issue-tracker-api/dist/main.js",
+            "/usr/bin/node"
+        ));
+        assert!(!is_known_system_process("node", "node /home/u/evolution-api/server.js", "/usr/bin/node"));
+    }
 
     #[test]
     fn browser_urls_require_http_loopback_and_a_valid_port() {

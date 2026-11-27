@@ -189,9 +189,27 @@ async fn set_extension_active(app: &AppHandle, active: bool) {
 fn is_gnome() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .is_ok_and(|desktops| desktops.split(':').any(|desktop| desktop.eq_ignore_ascii_case("gnome")))
-        && gio::SettingsSchemaSource::default()
-            .and_then(|source| source.lookup("org.gnome.shell", true))
-            .is_some()
+        && gnome_shell_running()
+}
+
+/// Budgie and GNOME Flashback also list "GNOME" but don't run GNOME Shell,
+/// so its extensions could never load there.
+fn gnome_shell_running() -> bool {
+    gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .and_then(|bus| {
+            bus.call_sync(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                Some(&("org.gnome.Shell",).to_variant()),
+                Some(glib::VariantTy::new("(b)").expect("valid type")),
+                gio::DBusCallFlags::NONE,
+                1000,
+                gio::Cancellable::NONE,
+            )
+        })
+        .is_ok_and(|reply| reply.get::<(bool,)>().is_some_and(|(owned,)| owned))
 }
 
 fn extension_dir() -> PathBuf {

@@ -166,7 +166,7 @@ export class PanelBlur {
             return;
         const frame = this._window.get_frame_rect();
         const buffer = this._window.get_buffer_rect();
-        const inset = this._inset;
+        const inset = this._inset();
         this._target.set_position(frame.x - buffer.x + inset, frame.y - buffer.y + inset);
         this._target.set_size(Math.max(1, frame.width - 2 * inset), Math.max(1, frame.height - 2 * inset));
     }
@@ -193,7 +193,7 @@ export class PanelBlur {
         const enabled = key => !settings.settings_schema.has_key(key) || settings.get_boolean(key);
         const popup = this._extension?.stateObj?._popup ?? global.blur_my_shell?._popup;
         const nativePipeline = typeof popup?.targets?.is_opt_in === 'function';
-        const menu = settings && settings.get_boolean('blur') && enabled('blur-menus')
+        const menu = settings && enabled('blur') && enabled('blur-menus')
             && (!nativePipeline || popup.enabled)
             ? this._menus.find(([, key]) => enabled(key))?.[0] : null;
         if (!actor || !menu) {
@@ -242,8 +242,11 @@ export class PanelBlur {
 
         const [effect] = this._target.get_effects();
         if (!nativePipeline && effect) {
-            effect.radius = settings.get_int('sigma') * 2;
-            effect.brightness = settings.get_double('brightness');
+            // A missing key would abort the Shell; keep the effect's defaults instead.
+            if (settings.settings_schema.has_key('sigma'))
+                effect.radius = settings.get_int('sigma') * 2;
+            if (settings.settings_schema.has_key('brightness'))
+                effect.brightness = settings.get_double('brightness');
         }
         const active = !nativePipeline || this._target.has_style_class_name(APPLIED);
         if (active)

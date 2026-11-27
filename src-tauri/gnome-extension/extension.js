@@ -23,12 +23,23 @@ const APP_ID = 'io.harbor.app';
 const CARD_INSET = 7;
 const LAUNCH_GRACE_US = 10 * GLib.USEC_PER_SEC;
 
+// Stage pixels per CSS pixel: 1 in logical-pixel sessions, 2 on X11 or without
+// scale-monitor-framebuffer at 200%.
+function uiScale() {
+    return St.ThemeContext.get_for_stage(global.stage).scale_factor;
+}
+
+function cardInset() {
+    return CARD_INSET * uiScale();
+}
+
 function cardRect(frame) {
+    const inset = cardInset();
     return {
-        x: frame.x + CARD_INSET,
-        y: frame.y + CARD_INSET,
-        width: frame.width - 2 * CARD_INSET,
-        height: frame.height - 2 * CARD_INSET,
+        x: frame.x + inset,
+        y: frame.y + inset,
+        width: frame.width - 2 * inset,
+        height: frame.height - 2 * inset,
     };
 }
 
@@ -67,13 +78,8 @@ class HarborButton extends PanelMenu.Button {
         // signal would take a Shell modal grab away from the Wayland client.
         this.menu.open = () => this._open();
         this.menu.close = () => extension._hide();
-        this.connect('button-press-event', () => {
-            if (this.menu.isOpen)
-                this.menu.close();
-            else
-                this.menu.open();
-            return true;
-        });
+        // PanelMenu.Button toggles its menu on both clicks and touch taps.
+        this.menu.toggle = () => (this.menu.isOpen ? this.menu.close() : this.menu.open());
         // Hovering usually precedes a click: let harbor start its WebView now.
         this.connect('enter-event', () => {
             if (!this.menu.isOpen) {
@@ -133,7 +139,7 @@ export default class HarborExtension extends Extension {
         Main.panel.addToStatusArea(this.uuid, this._button);
         // Like a tray icon: the button only exists while harbor is running.
         this._button.container.hide();
-        this._blur = new PanelBlur(CARD_INSET, (active, colors) =>
+        this._blur = new PanelBlur(cardInset, (active, colors) =>
             Gio.DBus.session.call(BUS_NAME, OBJECT_PATH, INTERFACE, 'SetBlur',
                 new GLib.Variant('(bay)', [active, colors]), null,
                 Gio.DBusCallFlags.NO_AUTO_START, 2000, null, null));
@@ -341,7 +347,7 @@ export default class HarborExtension extends Extension {
             if (frame) {
                 const card = cardRect(frame);
                 if (inside(card.x, card.y, card.width, card.height)) {
-                    const radius = Math.min(this._blur.cornerRadius, card.width / 2, card.height / 2);
+                    const radius = Math.min(this._blur.cornerRadius * uiScale(), card.width / 2, card.height / 2);
                     const dx = Math.max(0, radius - (x - card.x), x - (card.x + card.width - radius));
                     const dy = Math.max(0, radius - (y - card.y), y - (card.y + card.height - radius));
                     if (dx * dx + dy * dy <= radius * radius)
@@ -356,18 +362,20 @@ export default class HarborExtension extends Extension {
     _place(win) {
         if (!this._button)
             return;
-        const [buttonX] = this._button.get_transformed_position();
-        const [buttonWidth] = this._button.get_transformed_size();
-        const [, panelY] = Main.panel.get_transformed_position();
-        const [, panelHeight] = Main.panel.get_transformed_size();
+        // The button, not Main.panel: extensions like Dash to Panel move it into
+        // their own panel, which may sit at the bottom of the screen.
+        const [buttonX, buttonY] = this._button.get_transformed_position();
+        const [buttonWidth, buttonHeight] = this._button.get_transformed_size();
         const monitor = Main.layoutManager.findMonitorForActor(this._button);
         if (!monitor)
             return;
         const area = Main.layoutManager.getWorkAreaForMonitor(monitor.index);
-        if (area.height > 0 && area.height !== this._panelWorkHeight) {
-            this._panelWorkHeight = area.height;
+        // harbor sizes its window in CSS pixels.
+        const workHeight = Math.round(area.height / uiScale());
+        if (workHeight > 0 && workHeight !== this._panelWorkHeight) {
+            this._panelWorkHeight = workHeight;
             Gio.DBus.session.call(BUS_NAME, OBJECT_PATH, INTERFACE, 'SetPanelWorkHeight',
-                new GLib.Variant('(u)', [area.height]), null,
+                new GLib.Variant('(u)', [workHeight]), null,
                 Gio.DBusCallFlags.NO_AUTO_START, -1, null, null);
         }
         const frame = win.get_frame_rect();
@@ -377,12 +385,17 @@ export default class HarborExtension extends Extension {
         const theme = menu?.get_theme_node();
         const rise = theme?.get_length('-arrow-rise') ?? 0;
         const gap = theme?.get_length('-boxpointer-gap') ?? 0;
-        const {width: cardWidth} = cardRect(frame);
+        const {width: cardWidth, height: cardHeight} = cardRect(frame);
+        const inset = cardInset();
         const minX = area.x + rise;
         const maxX = Math.max(minX, area.x + area.width - cardWidth - rise);
         const cardX = Math.min(Math.max(buttonX + (buttonWidth - cardWidth) / 2, minX), maxX);
-        const x = Math.round(cardX - CARD_INSET);
-        const y = Math.round(Math.max(area.y, panelY + panelHeight + gap + rise) - CARD_INSET);
+        const bottomPanel = buttonY + buttonHeight / 2 > monitor.y + monitor.height / 2;
+        const cardY = bottomPanel
+            ? Math.min(area.y + area.height, buttonY - gap - rise) - cardHeight
+            : Math.max(area.y, buttonY + buttonHeight + gap + rise);
+        const x = Math.round(cardX - inset);
+        const y = Math.round(cardY - inset);
         if (frame.x !== x || frame.y !== y)
             win.move_frame(true, x, y);
         this._blur.position();

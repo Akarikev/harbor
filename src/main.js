@@ -152,7 +152,7 @@ const toast = byId('toast');
 const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
 
 let ports = [];
-let popupFocused = false;
+let popupOpen = false;
 let refreshInterval = null;
 let scanInFlight = false;
 let latestScanRequest = 0;
@@ -238,12 +238,12 @@ function showToast(message, tone = 'error') {
 function restartRefreshInterval() {
   clearInterval(refreshInterval);
   const ms = Number(refreshSelect.value);
-  refreshInterval = popupFocused && ms > 0 ? setInterval(refresh, ms) : null;
+  refreshInterval = popupOpen && ms > 0 ? setInterval(refresh, ms) : null;
 }
 
 async function refresh({ supersede = false } = {}) {
-  // The first scan runs before the window is shown (and focused); later ones only while open.
-  if ((!popupFocused && firstContentReady) || (scanInFlight && !supersede)) return;
+  // The first scan runs before the window is shown; later ones only while open.
+  if ((!popupOpen && firstContentReady) || (scanInFlight && !supersede)) return;
   const requestId = ++latestScanRequest;
   if (scanInFlight) return;
 
@@ -620,11 +620,13 @@ byId('quit-btn').addEventListener('click', () => {
   invokeCommand('quit_app').catch((err) => showToast(String(err)));
 });
 
-function handlePopupFocus(focused) {
-  if (popupFocused === focused) return;
-  popupFocused = focused;
+// Open means shown, not focused: some compositors map the popup without giving it
+// keyboard focus, and the list must still refresh there.
+function handlePopupOpen(open) {
+  if (popupOpen === open) return;
+  popupOpen = open;
   restartRefreshInterval();
-  if (focused) {
+  if (open) {
     requestedHeight = 0;
     sizePopup();
     refresh({ supersede: true });
@@ -674,17 +676,12 @@ async function init() {
   resizeObserver.observe(settingsView);
   sizePopup();
 
-  const appWindow = getCurrentAppWindow();
-  let focusEventCount = 0;
-  await appWindow.onFocusChanged(({ payload }) => {
-    ++focusEventCount;
-    handlePopupFocus(payload);
-  });
-  const focusEventCountAtQuery = focusEventCount;
-  const focused = await appWindow.isFocused();
-  if (focusEventCountAtQuery === focusEventCount) handlePopupFocus(focused);
+  // WebKitGTK reports the page hidden while the window is unmapped.
+  const syncOpen = () => handlePopupOpen(document.visibilityState === 'visible');
+  document.addEventListener('visibilitychange', syncOpen);
+  syncOpen();
   // Load the list before the window is shown; markFirstContentReady() then maps it.
-  // A recreated popup draws the last scan at once; the scan on focus refreshes it.
+  // A recreated popup draws the last scan at once; the scan on open refreshes it.
   const cached = await invokeCommand('cached_ports', { showAll: showAllToggle.checked }).catch(() => null);
   if (cached && !firstContentReady) {
     ports = cached;
@@ -723,6 +720,8 @@ document.addEventListener('mouseover', (event) => {
   if (!target) return;
   if (target.hasAttribute('title')) {
     target.dataset.tip = target.title;
+    // The title may be the element's only accessible name.
+    if (!target.hasAttribute('aria-label')) target.setAttribute('aria-label', target.title);
     target.removeAttribute('title');
   }
   if (!target.dataset.tip) return;

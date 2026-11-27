@@ -2,6 +2,32 @@
 
 All notable changes to harbor are documented in this file.
 
+## [0.3.2]
+
+### Fixed
+
+- **Settings offers to reinstall a missing GNOME extension.** If the extension's files were deleted while it stayed on GNOME's enabled list, Settings said "Installed" and hid the install button.
+- **No flash in the middle of the screen when opening on GNOME.** The popup is now placed under its top-bar button before its first frame is drawn, and moves by window-restoring extensions such as Deja Window are undone before they are drawn.
+- **Bottom panels.** With the panel at the bottom (KDE Plasma's default, Cinnamon, many Xfce/MATE layouts, waybar, or GNOME with Dash to Panel) the popup opens above the panel instead of at the top of the screen, and stays anchored there as it resizes.
+- **The list refreshes whenever the popup is shown**, not only while it has keyboard focus; some compositors show it without focusing it.
+- **GNOME at 200% scale without fractional scaling, and on X11**: the popup's card inset, blur area and click area now use the right pixel size. Tapping the top-bar button on a touchscreen opens the popup.
+- **GNOME integration is only offered where GNOME Shell runs** (not on Budgie or GNOME Flashback, which also report "GNOME").
+- **Kill reaches all child processes**, including those started from other threads (Go, Java), and signals the parent first so a supervisor can't respawn workers in between.
+- **Dev servers in folders named like system services can be killed.** Protection now matches program names only, so `~/code/issue-tracker-api` or `evolution-api` is no longer treated as a system process.
+- Commands with non-ASCII characters (e.g. `~/café/server.js`) display correctly.
+- Start at login works for paths containing `$`, quotes, backslashes or `%`.
+- Without a compositor (e.g. Xfce with compositing off), the popup has no black frame around it.
+- Process stats columns size to the desktop font, so wider fonts (DejaVu Sans, Noto Sans) no longer cut off memory or uptime.
+- On X11, launching harbor again while it runs no longer leaves a busy cursor.
+- Icon-only labels (uptime, CPU, memory, energy) keep their accessible names after their tooltip is shown.
+- The rpm package depends on the gtk-layer-shell library itself, so it installs on openSUSE as well as Fedora.
+- A `WEBKIT_DISABLE_COMPOSITING_MODE` value you set yourself is respected.
+
+### Changed
+
+- **Faster opens.** On GNOME, pointing at the top-bar button starts loading the popup in the background, so the click usually finds it ready. On every desktop, a reopened popup draws the last port list immediately while a fresh scan runs. The popup stays loaded for 5 minutes after it is closed (was 60 s), so most reopens are instant.
+- **Less memory while hidden.** WebKit's helper processes now exit when the popup is freed, the popup renders in software (the desktop does the blur), and harbor runs fewer background threads; release builds are stripped (18.0 → 11.7 MB).
+
 ## [0.3.1]
 
 ### Fixed
@@ -12,13 +38,6 @@ All notable changes to harbor are documented in this file.
   - **Fallback:** when no tint exists for that scheme, harbor uses its own colours at the desktop's translucency. Without blur, nothing changes.
 - **Popup stays on the top bar's monitor.** Plugging in or unplugging a monitor while the popup was open could move it onto a screen without the top bar. The GNOME extension now re-places it after the layout settles and caps its height to that monitor's work area.
 - Removed the hover-switching known issue; switching between harbor and other top-bar menus works.
-- **Settings offers to reinstall a missing GNOME extension.** If the extension's files were deleted while it stayed on GNOME's enabled list, Settings said "Installed" and hid the install button.
-- **No flash in the middle of the screen when opening on GNOME.** The popup is now placed under its top-bar button before its first frame is drawn, and moves by window-restoring extensions such as Deja Window are undone before they are drawn.
-
-### Changed
-
-- **Faster opens.** On GNOME, pointing at the top-bar button starts loading the popup in the background, so the click usually finds it ready. On every desktop, a reopened popup draws the last port list immediately while a fresh scan runs. The popup stays loaded for 5 minutes after it is closed (was 60 s), so most reopens are instant.
-- **Less memory while hidden.** WebKit's helper processes now exit when the popup is freed, the popup renders in software (the desktop does the blur), and harbor runs fewer background threads; release builds are stripped (18.0 → 11.7 MB).
 
 ## [0.3.0]
 

@@ -100,6 +100,8 @@ struct PopupLifecycle {
     pending_show: Option<PopupRequest>,
     requested_height: Option<u32>,
     panel_work_height: Option<u32>,
+    /// X11 only: the popup's bottom edge (physical px) when it opens above a bottom panel.
+    x11_bottom: Option<i32>,
 }
 
 struct PopupRequest {
@@ -225,6 +227,13 @@ pub(super) fn set_blur_palette(app: &AppHandle, palette: Option<BlurPalette>) {
     }
 }
 
+/// Without a compositor (e.g. Xfce with compositing off) transparent pixels are
+/// black, so the card fills the window instead of leaving a black ring.
+fn opaque_script() -> &'static str {
+    let composited = gdk::Screen::default().is_some_and(|screen| screen.is_composited());
+    if composited { "" } else { "document.documentElement.dataset.opaque = '';" }
+}
+
 fn font_script() -> String {
     fn css_family(name: Option<glib::GString>, fallback: &str) -> String {
         let family = name
@@ -277,6 +286,13 @@ pub(super) fn resize_popup(window: WebviewWindow, height: u32) -> Result<(), Str
         window
             .set_size(LogicalSize::new(POPUP_WIDTH as u32, height))
             .map_err(|err| err.to_string())?;
+        // X11 keeps the top-left corner on resize; keep the bottom edge above a bottom panel.
+        if let Some(bottom) = state.lifecycle().x11_bottom {
+            let scale = window.scale_factor().map_err(|err| err.to_string())?;
+            let x = window.outer_position().map_err(|err| err.to_string())?.x;
+            let y = bottom - (f64::from(height) * scale).round() as i32;
+            window.set_position(PhysicalPosition::new(x, y)).map_err(|err| err.to_string())?;
+        }
     }
     Ok(())
 }
@@ -329,6 +345,7 @@ fn create_window(app: &AppHandle, mode: PlacementMode) -> tauri::Result<WebviewW
         .ok_or(tauri::Error::WindowNotFound)?;
     let window = WebviewWindowBuilder::from_config(app, config)?
         .initialization_script(font_script())
+        .initialization_script(opaque_script())
         .initialization_script(blur_script(*app.state::<PopupPlacement>().blur_palette.lock().unwrap()))
         .build()?;
     let gtk_window = window.gtk_window()?;
@@ -611,7 +628,10 @@ fn show(app: &AppHandle, request: PopupRequest) -> tauri::Result<()> {
                 position_layer_shell(&gtk_window, tray_point);
             }
             PlacementMode::X11 => {
-                if let Some((point, scale)) = position_x11(app, tray_point) {
+                let height = f64::from(gtk_window.size().1);
+                let placed = position_x11(app, tray_point, height);
+                placement.lifecycle().x11_bottom = placed.and_then(|(_, bottom, _)| bottom);
+                if let Some((point, _, scale)) = placed {
                     window.set_position(point.to_logical::<f64>(scale))?;
                 } else {
                     let _ = window.center();
@@ -620,7 +640,7 @@ fn show(app: &AppHandle, request: PopupRequest) -> tauri::Result<()> {
             PlacementMode::Center | PlacementMode::LayerShell => (),
         }
     }
-    if let Some(token) = request.token.as_deref().filter(|_| gtk_window.display().backend().is_wayland()) {
+    if let Some(token) = request.token.as_deref() {
         gtk_window.set_startup_id(token);
     }
     if visible {
@@ -641,6 +661,15 @@ fn recently_lost_focus(last: Option<Instant>, now: Instant) -> bool {
 fn position_layer_shell(window: &gtk::ApplicationWindow, tray_point: Option<(i32, i32)>) {
     let display = window.display();
     let monitor = tray_point.and_then(|(x, y)| display.monitor_at_point(x, y));
+    // A tray in the lower half means a bottom panel (e.g. KDE's default): open above it.
+    let bottom = monitor.as_ref().zip(tray_point).is_some_and(|(monitor, (_, y))| {
+        let rect = monitor.geometry();
+        y > rect.y() + rect.height() / 2
+    });
+    window.set_anchor(Edge::Top, !bottom);
+    window.set_anchor(Edge::Bottom, bottom);
+    window.set_layer_shell_margin(Edge::Top, if bottom { 0 } else { MARGIN });
+    window.set_layer_shell_margin(Edge::Bottom, if bottom { MARGIN } else { 0 });
     let left = monitor.as_ref().zip(tray_point).map(|(monitor, (x, _))| {
         let rect = monitor.geometry();
         let width = POPUP_WIDTH as i32;
@@ -661,10 +690,13 @@ fn position_layer_shell(window: &gtk::ApplicationWindow, tray_point: Option<(i32
     window.set_layer_shell_margin(Edge::Right, if left.is_none() { MARGIN } else { 0 });
 }
 
+/// Returns the position, the bottom edge to keep when the popup opens above a
+/// bottom panel, and the monitor scale.
 fn position_x11(
     app: &AppHandle,
     tray_point: Option<(i32, i32)>,
-) -> Option<(PhysicalPosition<i32>, f64)> {
+    height: f64,
+) -> Option<(PhysicalPosition<i32>, Option<i32>, f64)> {
     let monitor = tray_point
         .and_then(|(x, y)| {
             // Tao passes this point to GDK's logical monitor lookup on X11.
@@ -674,22 +706,29 @@ fn position_x11(
         })
         .or_else(|| app.primary_monitor().ok().flatten())?;
     let scale = monitor.scale_factor();
-    let anchor_x = tray_point.map(|(x, _)| f64::from(x));
-    Some((x11_popup_position(anchor_x, *monitor.work_area(), scale), scale))
+    let anchor = tray_point.map(|(x, y)| (f64::from(x), f64::from(y)));
+    let (point, bottom) = x11_popup_position(anchor, *monitor.work_area(), scale, height * scale);
+    Some((point, bottom, scale))
 }
 
 fn x11_popup_position(
-    anchor_x: Option<f64>,
+    anchor: Option<(f64, f64)>,
     work_area: PhysicalRect<i32, u32>,
     scale: f64,
-) -> PhysicalPosition<i32> {
+    height: f64,
+) -> (PhysicalPosition<i32>, Option<i32>) {
     let width = POPUP_WIDTH * scale;
     let margin = f64::from(MARGIN) * scale;
     let left = f64::from(work_area.position.x);
+    let top = f64::from(work_area.position.y);
     let max_x = (left + f64::from(work_area.size.width) - width - margin).max(left + margin);
-    let x = anchor_x.map_or(max_x, |x| (x - width / 2.0).clamp(left + margin, max_x));
-    let y = f64::from(work_area.position.y) + margin;
-    PhysicalPosition::new(x, y).cast()
+    let x = anchor.map_or(max_x, |(x, _)| (x - width / 2.0).clamp(left + margin, max_x));
+    let work_bottom = top + f64::from(work_area.size.height);
+    if anchor.is_some_and(|(_, y)| y > top + f64::from(work_area.size.height) / 2.0) {
+        let bottom = work_bottom - margin;
+        return (PhysicalPosition::new(x, bottom - height).cast(), Some(bottom.round() as i32));
+    }
+    (PhysicalPosition::new(x, top + margin).cast(), None)
 }
 
 #[cfg(test)]
@@ -710,9 +749,10 @@ mod tests {
             position: (0, 32).into(),
             size: (1920, 1048).into(),
         };
-        assert_eq!(x11_popup_position(Some(1255.0), work_area, 1.0), (1067, 44).into());
-        assert_eq!(x11_popup_position(Some(1919.0), work_area, 1.0), (1532, 44).into());
-        assert_eq!(x11_popup_position(None, work_area, 1.0), (1532, 44).into());
+        let at = |anchor| x11_popup_position(anchor, work_area, 1.0, 300.0);
+        assert_eq!(at(Some((1255.0, 10.0))), ((1067, 44).into(), None));
+        assert_eq!(at(Some((1919.0, 10.0))), ((1532, 44).into(), None));
+        assert_eq!(at(None), ((1532, 44).into(), None));
     }
 
     #[test]
@@ -721,7 +761,21 @@ mod tests {
             position: (-2560, 200).into(),
             size: (2560, 1440).into(),
         };
-        assert_eq!(x11_popup_position(Some(-1280.0), work_area, 2.0), (-1656, 224).into());
-        assert_eq!(x11_popup_position(Some(-20.0), work_area, 2.0), (-776, 224).into());
+        let at = |x| x11_popup_position(Some((x, 210.0)), work_area, 2.0, 600.0).0;
+        assert_eq!(at(-1280.0), (-1656, 224).into());
+        assert_eq!(at(-20.0), (-776, 224).into());
+    }
+
+    #[test]
+    fn opens_above_a_bottom_panel() {
+        // Bottom panel: the work area ends at 1040 and the tray sits below it.
+        let work_area = PhysicalRect {
+            position: (0, 0).into(),
+            size: (1920, 1040).into(),
+        };
+        assert_eq!(
+            x11_popup_position(Some((1800.0, 1060.0)), work_area, 1.0, 300.0),
+            ((1532, 728).into(), Some(1028))
+        );
     }
 }

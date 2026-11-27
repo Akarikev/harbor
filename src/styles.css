@@ -29,6 +29,8 @@
   --card-radius: 13px;
 }
 
+:root[data-opaque] { --inset: 0px; --card-radius: 0px; }
+
 :root:where(
   [data-theme-mode="dark"],
   [data-theme-mode="system"][data-palette-scheme="dark"],
@@ -262,12 +264,14 @@ svg {
 .meta-item { display: inline-flex; align-items: center; gap: 2px; min-width: 0; line-height: normal; }
 .energy { font-weight: 500; }
 .meta-item { flex: none; }
-/* Exact column widths so the energy status lines up on every row (12px text). */
+/* Fixed column widths so the energy status lines up on every row (12px text). */
 /* Clip only sideways: vertical clipping cut the tops off 12px glyphs. */
 .meta-values > .meta-item { flex: none; overflow-x: clip; overflow-y: visible; }
-.meta-values > .meta-item:nth-child(1) { width: 62px; }
-.meta-values > .meta-item:nth-child(2) { width: 40px; }
-.meta-values > .meta-item:nth-child(3) { width: 58px; }
+/* Icon (12px) + gap (2px) + the widest value ("23h 59m", "100%", "1023 MB") in the
+   desktop font's digits, so wider fonts like DejaVu Sans don't clip. */
+.meta-values > .meta-item:nth-child(1) { width: calc(14px + 7.2ch); }
+.meta-values > .meta-item:nth-child(2) { width: calc(14px + 4.6ch); }
+.meta-values > .meta-item:nth-child(3) { width: calc(14px + 7.2ch); }
 /* Keep omitted items measurable so they can return as the row widens. */
 .meta-overflow { position: absolute; width: max-content; visibility: hidden; }
 .energy[data-impact="low"] { color: var(--green); }
