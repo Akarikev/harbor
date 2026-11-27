@@ -78,8 +78,18 @@ class HarborButton extends PanelMenu.Button {
         // signal would take a Shell modal grab away from the Wayland client.
         this.menu.open = () => this._open();
         this.menu.close = () => extension._hide();
-        // PanelMenu.Button toggles its menu on both clicks and touch taps.
-        this.menu.toggle = () => (this.menu.isOpen ? this.menu.close() : this.menu.open());
+        // Handle clicks and taps here: GNOME 50 disables PanelMenu.Button's own click
+        // gesture for dummy menus, and 45–49 only call the dummy menu's no-op toggle().
+        const toggle = () => {
+            if (this.menu.isOpen)
+                this.menu.close();
+            else
+                this.menu.open();
+            return Clutter.EVENT_STOP;
+        };
+        this.connect('button-press-event', toggle);
+        this.connect('touch-event', (_actor, event) =>
+            event.type() === Clutter.EventType.TOUCH_BEGIN ? toggle() : Clutter.EVENT_PROPAGATE);
         // Hovering usually precedes a click: let harbor start its WebView now.
         this.connect('enter-event', () => {
             if (!this.menu.isOpen) {
