@@ -2,6 +2,121 @@
 
 All notable changes to harbor are documented in this file.
 
+## [0.3.2]
+
+### Fixed
+
+- **Settings offers to reinstall a missing GNOME extension.** If the extension's files were deleted while it stayed on GNOME's enabled list, Settings said "Installed" and hid the install button.
+- **No flash in the middle of the screen when opening on GNOME.** The popup is now placed under its top-bar button before its first frame is drawn, and moves by window-restoring extensions such as Deja Window are undone before they are drawn.
+- **Bottom panels.** With the panel at the bottom (KDE Plasma's default, Cinnamon, many Xfce/MATE layouts, waybar, or GNOME with Dash to Panel) the popup opens above the panel instead of at the top of the screen, and stays anchored there as it resizes.
+- **The list refreshes whenever the popup is shown**, not only while it has keyboard focus; some compositors show it without focusing it.
+- **GNOME at 200% scale without fractional scaling, and on X11**: the popup's card inset, blur area and click area now use the right pixel size. Tapping the top-bar button on a touchscreen opens the popup.
+- **GNOME integration is only offered where GNOME Shell runs** (not on Budgie or GNOME Flashback, which also report "GNOME").
+- **Kill reaches all child processes**, including those started from other threads (Go, Java), and signals the parent first so a supervisor can't respawn workers in between.
+- **Dev servers in folders named like system services can be killed.** Protection now matches program names only, so `~/code/issue-tracker-api` or `evolution-api` is no longer treated as a system process.
+- Commands with non-ASCII characters (e.g. `~/café/server.js`) display correctly.
+- Start at login works for paths containing `$`, quotes, backslashes or `%`.
+- Without a compositor (e.g. Xfce with compositing off), the popup has no black frame around it.
+- Process stats columns size to the desktop font, so wider fonts (DejaVu Sans, Noto Sans) no longer cut off memory or uptime.
+- On X11, launching harbor again while it runs no longer leaves a busy cursor.
+- Icon-only labels (uptime, CPU, memory, energy) keep their accessible names after their tooltip is shown.
+- The rpm package depends on the gtk-layer-shell library itself, so it installs on openSUSE as well as Fedora.
+- A `WEBKIT_DISABLE_COMPOSITING_MODE` value you set yourself is respected.
+
+### Changed
+
+- **Faster opens.** On GNOME, pointing at the top-bar button starts loading the popup in the background, so the click usually finds it ready. On every desktop, a reopened popup draws the last port list immediately while a fresh scan runs. The popup stays loaded for 5 minutes after it is closed (was 60 s), so most reopens are instant.
+- **Less memory while hidden.** WebKit's helper processes now exit when the popup is freed, the popup renders in software (the desktop does the blur), and harbor runs fewer background threads; release builds are stripped (18.0 → 11.7 MB).
+
+## [0.3.1]
+
+### Fixed
+
+- **Theme setting works with desktop blur.** Light and Dark had no visible effect while the desktop's blur was on, because the desktop palette overrode harbor's theme colours. Now System, Light and Dark all follow the desktop's own menu tint for that scheme, while the blur and corner radius stay:
+  - **GNOME:** the other scheme's tint is read offscreen from the shell's light/dark stylesheets (including Ubuntu's Yaru and Blur my Shell's adaptive tint), without restyling the desktop.
+  - **KDE Plasma:** it comes from the configured light/dark colour-scheme pair (Breeze Light/Dark by default) and updates live when the scheme changes.
+  - **Fallback:** when no tint exists for that scheme, harbor uses its own colours at the desktop's translucency. Without blur, nothing changes.
+- **Popup stays on the top bar's monitor.** Plugging in or unplugging a monitor while the popup was open could move it onto a screen without the top bar. The GNOME extension now re-places it after the layout settles and caps its height to that monitor's work area.
+- Removed the hover-switching known issue; switching between harbor and other top-bar menus works.
+
+## [0.3.0]
+
+### Added
+
+- **Background blur that follows the desktop.** harbor never adds blur of its own: on GNOME it is blurred only when Blur my Shell is enabled (using its pipeline, with detection fixed for Blur my Shell's newer pipeline setup); on KDE Plasma only when KWin's blur effect is on (via `ext-background-effect-v1`, falling back to `org_kde_kwin_blur` on older KWin); on Hyprland/SwayFX the compositor's own rules apply. Other desktops keep the plain look.
+- **Theme-matched colours.** The tint, text colour and corner radius come from the live theme (GNOME panel-menu theme nodes, the KDE colour scheme), so harbor looks like the other panel menus. Secondary text is a solid mix of the theme text colour so it never washes out.
+- The GNOME top-bar button appears only while harbor is running, like a tray icon.
+- `TESTING.md`: a cross-desktop release checklist (KDE, Xfce, wlroots).
+
+### Changed
+
+- Compact two-line rows: hover icons sit on the name line, and uptime, CPU, memory and energy are aligned 12 px columns. The launching app (terminal/editor) moved to the expanded details.
+- Narrower popup (376 px window, 362 px card); copying a port shows a check mark on the button instead of a toast.
+- Settings use plain rows with separators and text-style dropdowns; dropdown menus and tooltips have a solid surface so they read over any background.
+- Sharper text rendering (no greyscale anti-aliasing).
+
+### Fixed
+
+- Reopening harbor after its idle WebView was freed no longer shows the window growing or stuttering: the list is scanned and rendered while the window is hidden, and it appears once at its final height (with a fallback so it always appears). The offscreen WebKit snapshot step was removed.
+- An older harbor (for example a previously installed package autostarting) can no longer replace a newer installed GNOME extension; extension refreshes are version-gated.
+- Meta text no longer clips at the top, and stays readable over light backgrounds.
+
+### Security
+
+- Theme colours from the GNOME extension arrive as raw bytes and are accepted only from the extension's own D-Bus connection.
+
+### Known issues
+
+- KDE, Xfce and wlroots desktops are code-reviewed but not yet tested live; see `TESTING.md`.
+
+## [0.2.0]
+
+This release is a full pass over the 0.1.0 implementation: correctness and safety fixes, a new tray and popup architecture, large memory and CPU savings, a redesigned UI, and GNOME integration.
+
+### Fixed — correctness and safety
+
+- Port scans no longer freeze the tray and window: scanning runs off the main thread (it previously blocked the UI for every scan, up to 10 s).
+- CPU and uptime are correct for processes whose names contain spaces or parentheses (e.g. `next-server (v16.2.7)`); the clock tick is read from the system instead of assumed.
+- Kill protection has a single source of truth in the backend: processes of other users and known system services are always protected; the UI no longer overrides it with name-based guesses. Your own processes stay killable with confirmation.
+- A port bound on both IPv4 and IPv6 shows as one row (PIDs merged, protected if any owner is); the main PID per port is deterministic so rows don't rebuild on refresh.
+- Before killing, harbor re-checks that the PIDs still own that port, so a PID reused since the last scan is never signalled.
+- "Open in browser" no longer leaves a defunct process per click, accepts only `http://localhost:<port>` / `http://127.0.0.1:<port>`, and passes the desktop's activation token so the browser comes to the front.
+- Scoped npm packages resolve to their name (`@openai/codex` → `codex`); the backend is the only source of process names.
+- Expanded row details (CPU, memory, uptime, energy) update on every refresh instead of showing stale values.
+- harbor no longer creates a duplicate tray icon, and no longer fails to start when no tray host is running yet.
+
+### Changed — tray, placement and behaviour
+
+- Replaced Tauri's tray and the deprecated `libayatana-appindicator` with a StatusNotifierItem tray over D-Bus (`ksni`): single click opens harbor on KDE, Xfce, Cinnamon and other SNI hosts; double click on GNOME's AppIndicator extension. The tray menu has a single "Open harbor" item (Quit is in the popup).
+- Popup placement per desktop: wlr layer-shell anchored under the panel (KDE, Hyprland, Sway, niri, COSMIC), positioned at the tray icon on X11, compositor-placed on GNOME.
+- The popup takes focus via the desktop's activation token, hides when it loses focus or on Escape, can't be dragged, and clicking the tray icon while it's open closes it.
+- Single instance: launching harbor again opens the popup in the running instance. Autostart runs `harbor --hidden`; normal launches show the popup.
+
+### Added
+
+- **GNOME Shell companion extension** (enable from Settings → GNOME): harbor's own top-bar button opens the popup directly under it with one click, matches the gap of GNOME's own panel menus, keeps the top pinned as the popup resizes, closes on outside clicks, focus changes or other panel menus, and keeps harbor out of the dock. While it is active harbor hides its tray icon. Works on any GNOME distro without the AppIndicator extension.
+- **Start at login** toggle (XDG autostart, works on all desktops; AppImage-aware).
+- Live reload for HTML, CSS and JavaScript during `bun run dev`.
+
+### Changed — performance and memory
+
+- Scanning reads `/proc/net/tcp{,6}` directly with a cached socket-owner map instead of running `ss` (steady-state scan ~73 ms → ~3 ms CPU) and no longer depends on iproute2.
+- Polling only runs while the popup is open (zero scans while hidden), scans never overlap, and stale results are discarded.
+- CPU % and energy reflect current usage (delta between scans) instead of a lifetime average.
+- The WebView is created on demand and freed after 60 s hidden, then memory is returned to the system (`malloc_trim`): about 24 MB while hidden after login versus ~150 MB before.
+- Removed `tauri-plugin-opener` and its dependencies; the popup makes no network requests (system font instead of Google Fonts).
+- The panel's grain texture is composited once instead of being repainted on every refresh (~6× less WebKit CPU while open).
+
+### Changed — interface
+
+- Redesigned popup: the desktop's own fonts (monospace only for port numbers), content-driven height with scrolling past a cap, translucent panel with solid header and footer, inline Kill/Force confirmation instead of a modal, hover actions, and an in-popup Settings view grouped into General, Killing and Appearance.
+- Settings dropdowns render inside the popup (native dropdowns opened a separate window and closed harbor); the popup always reopens on the port list.
+- Native-app behaviour: no page zoom (pinch, Ctrl+scroll, zoom keys), no browser context menu in release builds, no stray text selection, pill tooltips.
+
+### Packaging
+
+- deb/rpm depend on `gtk-layer-shell` instead of appindicator; the AppImage bundles `libgtk-layer-shell`; every bundle embeds the GNOME extension. README and build instructions updated.
+
 ## [0.1.0] - 2026-07-11
 
 Initial release. Inspired by [Ports](https://ports-app.com) for macOS by Alex Tapper.

@@ -1,12 +1,15 @@
+use ksni::TrayMethods;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::sync::mpsc;
-use std::time::Duration;
-use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
-};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Manager};
+
+mod autostart;
+mod gnome;
+mod kde_blur;
+mod popup;
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
 
@@ -16,6 +19,7 @@ pub struct PortEntry {
     pub pid: u32,
     pub pids: Vec<u32>,
     pub process_name: String,
+    pub launched_from: String,
     pub cmdline: String,
     pub cwd: String,
     pub state: String,
@@ -87,10 +91,8 @@ fn package_name_from_script_path(path: &str) -> Option<String> {
 
     if let Some(idx) = parts.iter().position(|p| *p == "node_modules") {
         if let Some(pkg) = parts.get(idx + 1) {
-            if *pkg == ".bin" {
-                if let Some(bin) = parts.get(idx + 2) {
-                    return Some((*bin).to_string());
-                }
+            if *pkg == ".bin" || pkg.starts_with('@') {
+                return parts.get(idx + 2).map(|name| (*name).to_string());
             } else if !pkg.starts_with('.') {
                 return Some((*pkg).to_string());
             }
@@ -175,66 +177,24 @@ fn cmdline_display_name(cmdline: &str) -> Option<String> {
 }
 
 /// Prefer a human-meaningful name over Chromium/Node thread labels like "MainThread".
-fn resolve_display_name(pid: u32, ss_name: &str, cmdline: &str) -> String {
-    let ss_trimmed = ss_name.trim();
-    if ss_trimmed.to_lowercase().starts_with("next-server") {
-        return "next".to_string();
+fn resolve_display_name(pid: u32, cmdline: &str) -> String {
+    if let Some(name) = cmdline_display_name(cmdline) {
+        return name;
     }
 
-    let candidates = [
-        cmdline_display_name(cmdline),
-        {
-            if !ss_trimmed.is_empty() && !is_generic_thread_name(ss_trimmed) {
-                Some(ss_trimmed.to_string())
-            } else {
-                None
-            }
-        },
-        {
-            let comm = if pid > 0 {
-                get_process_name(pid)
-            } else {
-                String::new()
-            };
-            if comm.to_lowercase().starts_with("next-server") {
-                Some("next".to_string())
-            } else if !comm.is_empty() && !is_generic_thread_name(&comm) {
-                Some(comm)
-            } else {
-                None
-            }
-        },
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if !candidate.is_empty() {
-            return candidate;
-        }
-    }
-
-    if !ss_trimmed.is_empty() {
-        return ss_trimmed.to_string();
-    }
-
-    let comm = if pid > 0 {
-        get_process_name(pid)
+    let comm = if pid > 0 { get_process_name(pid) } else { String::new() };
+    if comm.to_lowercase().starts_with("next-server") {
+        "next".to_string()
+    } else if comm.is_empty() {
+        "unknown".to_string()
     } else {
-        String::new()
-    };
-    if !comm.is_empty() {
-        return comm;
+        comm
     }
-
-    "unknown".to_string()
 }
 
 fn get_cmdline(pid: u32) -> String {
     let raw = fs::read(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
-    let s: String = raw
-        .iter()
-        .map(|&b| if b == 0 { ' ' } else { b as char })
-        .collect();
-    let trimmed = s.trim().to_string();
+    let trimmed = String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string();
     if !trimmed.is_empty() {
         return trimmed;
     }
@@ -260,25 +220,19 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn get_process_uid(pid: u32) -> Option<u32> {
-    if pid == 0 {
-        return None;
-    }
-
-    fs::read_to_string(format!("/proc/{}/status", pid))
-        .ok()?
+fn parse_process_uid(status: &str) -> Option<u32> {
+    status
         .lines()
         .find(|line| line.starts_with("Uid:"))
         .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|value| value.parse::<u32>().ok())
+        .and_then(|value| value.parse().ok())
 }
 
-fn is_path_under_home(path: &str) -> bool {
-    path.starts_with("/home/") || path.starts_with("/Users/")
-}
-
-fn is_known_system_process(name: &str, cmdline: &str, exe: &str) -> bool {
-    let hay = format!("{name} {cmdline} {exe}").to_lowercase();
+/// Matches program names only: markers in arguments or paths (e.g. a project in
+/// ~/code/issue-tracker-api) must not make a dev server unkillable.
+fn is_known_system_process(comm: &str, cmdline: &str, exe: &str) -> bool {
+    let argv0 = cmdline.split_whitespace().next().unwrap_or_default();
+    let hay = format!("{comm} {} {}", basename_from_path(argv0), basename_from_path(exe)).to_lowercase();
     const MARKERS: &[&str] = &[
         "ulauncher",
         "gnome-shell",
@@ -320,87 +274,55 @@ fn is_known_system_process(name: &str, cmdline: &str, exe: &str) -> bool {
     MARKERS.iter().any(|marker| hay.contains(marker))
 }
 
-fn is_local_dev_server(name: &str, cmdline: &str, exe: &str, cwd: &str) -> bool {
-    let lower = format!("{name} {cmdline} {exe} {cwd}").to_lowercase();
-
-    // Explicit app/dev servers — including Next's rewritten process title.
-    if lower.contains("next")
-        || lower.contains("vite")
-        || lower.contains("nuxt")
-        || lower.contains("webpack")
-        || lower.contains("remix")
-        || lower.contains("astro")
-        || lower.contains("react-scripts")
-        || lower.contains("openclaw")
-        || lower.contains("tauri")
-    {
-        return true;
-    }
-
-    // Known desktop/system apps are never "local servers".
-    if is_known_system_process(name, cmdline, exe) {
-        return false;
-    }
-
-    let under_home = is_path_under_home(cwd) || is_path_under_home(exe);
-    // Only JS runtimes auto-qualify from $HOME — system python apps (ulauncher)
-    // also have a home cwd and must not be treated as killable servers.
-    let is_js_runtime = lower.contains("node") || lower.contains("bun") || lower.contains("deno");
-
-    under_home && is_js_runtime
+fn compute_is_protected(pid: u32, uid: u32, euid: u32, is_system: bool) -> bool {
+    pid == 0 || is_system || uid != euid
 }
 
-fn compute_is_protected(pid: u32, uid: u32, name: &str, cmdline: &str, cwd: &str) -> bool {
-    if pid == 0 {
-        return true;
-    }
-
-    let exe = get_process_exe(pid);
-
-    // Desktop/system services first (ulauncher etc. can have a $HOME cwd).
-    if is_known_system_process(name, cmdline, &exe) {
-        return true;
-    }
-
-    // Local app servers stay killable.
-    if is_local_dev_server(name, cmdline, &exe, cwd) {
-        return false;
-    }
-
-    if uid != current_euid() {
-        return true;
-    }
-
-    false
+fn is_process_protected(pid: u32, uid: u32, cmdline: &str) -> bool {
+    let is_system =
+        pid != 0 && is_known_system_process(&get_process_name(pid), cmdline, &get_process_exe(pid));
+    compute_is_protected(pid, uid, current_euid(), is_system)
 }
 
 fn is_pid_protected(pid: u32) -> bool {
-    let uid = get_process_uid(pid).unwrap_or_else(current_euid);
-    let cmdline = get_cmdline(pid);
-    let cwd = get_process_cwd(pid);
-    let name = resolve_display_name(pid, "", &cmdline);
-    compute_is_protected(pid, uid, &name, &cmdline, &cwd)
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let uid = parse_process_uid(&status).unwrap_or_else(current_euid);
+    is_process_protected(pid, uid, &get_cmdline(pid))
 }
 
-fn make_port_entry(
-    port: u16,
-    pid: u32,
-    pids: Vec<u32>,
-    process_name: String,
-    cmdline: String,
-    cwd: String,
-    cpu_percent: f32,
-    mem_mb: f32,
-    uptime_seconds: u64,
-) -> PortEntry {
-    let uid = get_process_uid(pid).unwrap_or_else(current_euid);
-    let is_protected = compute_is_protected(pid, uid, &process_name, &cmdline, &cwd);
+fn make_port_entry(socket: ListeningSocket, pid: u32, cpu_scan: &mut CpuScan) -> PortEntry {
+    let (pids, cmdline, cwd, uid, mem_mb, cpu_percent, uptime_seconds, launched_from) = if pid == 0 {
+        (vec![], String::new(), String::new(), socket.uid, 0.0, 0.0, 0, "service".into())
+    } else {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let uid = parse_process_uid(&status).unwrap_or(socket.uid);
+        let mem_mb = status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<f32>().ok())
+            .map_or(0.0, |kb| kb / 1024.0);
+        let (cpu_percent, uptime_seconds, launched_from) = get_process_stats(pid, cpu_scan);
+        (
+            vec![pid],
+            get_cmdline(pid),
+            get_process_cwd(pid),
+            uid,
+            mem_mb,
+            cpu_percent,
+            uptime_seconds,
+            launched_from,
+        )
+    };
+    let process_name = resolve_display_name(pid, &cmdline);
+    let is_protected = is_process_protected(pid, uid, &cmdline);
 
     PortEntry {
-        port,
+        port: socket.port,
         pid,
         pids,
         process_name,
+        launched_from,
         cmdline,
         cwd,
         state: "listening".to_string(),
@@ -433,15 +355,20 @@ fn send_signal(pid: u32, signal: i32) -> Result<(), String> {
     ))
 }
 
+/// Children of every thread: runtimes like Go and Java spawn from non-main threads.
 fn get_child_pids(pid: u32) -> Vec<u32> {
-    let children_path = format!("/proc/{}/task/{}/children", pid, pid);
-    let Ok(content) = fs::read_to_string(children_path) else {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
         return Vec::new();
     };
-
-    content
-        .split_whitespace()
-        .filter_map(|value| value.parse::<u32>().ok())
+    tasks
+        .flatten()
+        .filter_map(|task| fs::read_to_string(task.path().join("children")).ok())
+        .flat_map(|content| {
+            content
+                .split_whitespace()
+                .filter_map(|value| value.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -464,322 +391,388 @@ fn kill_process_tree(pid: u32, signal: i32) -> Result<(), String> {
         }
     }
 
-    for current in ordered.iter().rev().copied() {
-        let _ = send_signal(current, signal);
+    // Parent first, so a supervisor can't respawn workers between the signals.
+    let root = send_signal(pid, signal);
+    for child in ordered.into_iter().skip(1) {
+        let _ = send_signal(child, signal);
     }
-
-    send_signal(pid, signal)
+    root
 }
 
 fn num_cpus() -> f32 {
-    fs::read_to_string("/proc/cpuinfo")
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| l.starts_with("processor"))
-        .count()
-        .max(1) as f32
+    static NUM_CPUS: OnceLock<f32> = OnceLock::new();
+    *NUM_CPUS.get_or_init(|| {
+        fs::read_to_string("/proc/cpuinfo")
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("processor"))
+            .count()
+            .max(1) as f32
+    })
 }
 
-fn get_process_stats(pid: u32) -> (f32, f32, u64) {
-    let mem_mb = fs::read_to_string(format!("/proc/{}/status", pid))
-        .unwrap_or_default()
-        .lines()
-        .find(|l| l.starts_with("VmRSS:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse::<f32>().ok())
-        .map(|kb| kb / 1024.0)
-        .unwrap_or(0.0);
+fn split_proc_stat(stat: &str) -> Option<(&str, &str)> {
+    stat.split_once('(')?.1.rsplit_once(')')
+}
 
-    let (cpu_percent, uptime_secs) = (|| -> Option<(f32, u64)> {
-        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-        let fields: Vec<&str> = stat.split_whitespace().collect();
-        let utime: u64 = fields.get(13)?.parse().ok()?;
-        let stime: u64 = fields.get(14)?.parse().ok()?;
-        let starttime: u64 = fields.get(21)?.parse().ok()?;
-        let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
-        let uptime: f64 = uptime_str.split_whitespace().next()?.parse().ok()?;
-        let clk_tck = 100u64;
-        let seconds = uptime - (starttime as f64 / clk_tck as f64);
-        if seconds <= 0.0 {
-            return Some((0.0, 0));
+fn parse_proc_stat(stat: &str) -> Option<(u32, u64, u64, u64)> {
+    // Field 3 (state) follows the final ')' of field 2 (comm).
+    let mut fields = split_proc_stat(stat)?.1.split_whitespace();
+    let parent = fields.nth(1)?.parse().ok()?;
+    let utime = fields.nth(14 - 5)?.parse().ok()?;
+    let stime = fields.next()?.parse().ok()?;
+    let starttime = fields.nth(22 - 16)?.parse().ok()?;
+    Some((parent, utime, stime, starttime))
+}
+
+fn resolve_launch_app(ancestors: impl IntoIterator<Item = String>) -> String {
+    let mut fallback = None;
+    for ancestor in ancestors {
+        let name = ancestor.trim();
+        let known = match name.to_ascii_lowercase().as_str() {
+            "systemd" | "init" => break,
+            "bash" | "dash" | "sh" | "zsh" | "fish" | "ksh" | "tcsh" | "csh" | "nu"
+            | "login" | "sudo" | "su" | "doas" | "env" => continue,
+            "ptyxis" | "ptyxis-agent" => "Ptyxis",
+            "gnome-terminal" | "gnome-terminal-" | "gnome-terminal-server" => "GNOME Terminal",
+            "kgx" | "gnome-console" => "GNOME Console",
+            "konsole" => "Konsole",
+            "kitty" => "Kitty",
+            "alacritty" => "Alacritty",
+            "wezterm" | "wezterm-gui" => "WezTerm",
+            "foot" | "footclient" => "Foot",
+            "ghostty" => "Ghostty",
+            "tilix" => "Tilix",
+            "terminator" => "Terminator",
+            "xterm" => "XTerm",
+            "code" | "code-insiders" | "code-oss" => "VS Code",
+            "codium" | "vscodium" => "VSCodium",
+            "cursor" => "Cursor",
+            "zed" | "zed-editor" => "Zed",
+            "idea" | "idea64" | "intellij-idea" => "IntelliJ IDEA",
+            "pycharm" => "PyCharm",
+            "webstorm" => "WebStorm",
+            "goland" => "GoLand",
+            "rustrover" => "RustRover",
+            "clion" => "CLion",
+            "phpstorm" => "PhpStorm",
+            "rubymine" => "RubyMine",
+            "datagrip" => "DataGrip",
+            "rider" => "Rider",
+            "jetbrains" => "JetBrains",
+            "tmux" | "tmux: server" | "tmux: client" => "tmux",
+            "zellij" => "Zellij",
+            "herdr" => "Herdr",
+            _ => {
+                if fallback.is_none() && !name.is_empty() {
+                    fallback = Some(name.to_owned());
+                }
+                continue;
+            }
+        };
+        return known.into();
+    }
+    fallback.unwrap_or_else(|| "service".into())
+}
+
+fn read_launch_app(mut parent: u32) -> String {
+    resolve_launch_app(std::iter::from_fn(|| {
+        if parent == 0 {
+            return None;
         }
-        let cpu = ((utime + stime) as f64 / clk_tck as f64 / seconds * 100.0) as f32;
-        Some((cpu.min(100.0 * num_cpus()), seconds as u64))
-    })()
-    .unwrap_or((0.0, 0));
-
-    (cpu_percent, mem_mb, uptime_secs)
+        let stat = fs::read_to_string(format!("/proc/{parent}/stat")).ok()?;
+        let (comm, fields) = split_proc_stat(&stat)?;
+        let name = if matches!(comm, "java" | "javaw") {
+            let cmdline = get_cmdline(parent);
+            cmdline
+                .split_whitespace()
+                .find_map(|arg| arg.strip_prefix("-Didea.platform.prefix="))
+                .unwrap_or(comm)
+                .to_owned()
+        } else {
+            comm.to_owned()
+        };
+        parent = fields.split_whitespace().nth(1)?.parse().ok()?;
+        Some(name)
+    }).take(64))
 }
 
-// ─── Port scanning via `ss` (fast) ───────────────────────────────────────────
-//
-// `ss -tlnp` output (no header):
-//   LISTEN 0 128 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=1234,fd=22))
-//   LISTEN 0 128 [::]:8080    [::]:*     users:(("python3",pid=5678,fd=5))
+type ProcessKey = (u32, u64);
+type CpuSamples = HashMap<ProcessKey, CpuSample>;
 
-fn scan_with_ss(show_all: bool) -> Option<Vec<PortEntry>> {
-    let output = std::process::Command::new("ss")
-        .args(["-tlnp", "--no-header"])
-        .output()
-        .ok()?;
+struct CpuSample {
+    ticks: u64,
+    time: Instant,
+    launched_from: String,
+}
 
-    if !output.status.success() {
+struct CpuScan {
+    // Keep sample updates and pruning together if another scan is already running.
+    samples: MutexGuard<'static, CpuSamples>,
+    readings: HashMap<ProcessKey, f32>,
+    uptime: Option<f64>,
+    clk_tck: f64,
+}
+
+impl CpuScan {
+    fn new() -> Self {
+        static CPU_SAMPLES: OnceLock<Mutex<CpuSamples>> = OnceLock::new();
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        let uptime = fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| text.split_whitespace().next()?.parse().ok());
+        Self {
+            samples: CPU_SAMPLES
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(|err| err.into_inner()),
+            readings: HashMap::new(),
+            uptime,
+            clk_tck: if clk_tck > 0 { clk_tck as f64 } else { 100.0 },
+        }
+    }
+
+    fn finish(mut self) {
+        self.samples.retain(|key, _| self.readings.contains_key(key));
+    }
+}
+
+fn cpu_usage_percent(delta_ticks: u64, elapsed_secs: f64, clk_tck: f64, cpus: f32) -> f32 {
+    if elapsed_secs <= 0.0 {
+        return 0.0;
+    }
+    (delta_ticks as f64 / clk_tck / elapsed_secs * 100.0).clamp(0.0, 100.0 * f64::from(cpus))
+        as f32
+}
+
+fn get_process_stats(pid: u32, cpu_scan: &mut CpuScan) -> (f32, u64, String) {
+    let Some((parent, utime, stime, starttime)) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_proc_stat(&stat))
+    else {
+        return (0.0, 0, "service".into());
+    };
+    let now = Instant::now();
+    let clk_tck = cpu_scan.clk_tck;
+    let seconds = (cpu_scan.uptime.unwrap_or(0.0) - starttime as f64 / clk_tck).max(0.0);
+    let total_ticks = utime + stime;
+    let key = (pid, starttime);
+    let mut elapsed = seconds;
+    let mut delta = total_ticks;
+    let sample = cpu_scan.samples.entry(key).and_modify(|sample| {
+        elapsed = now.duration_since(sample.time).as_secs_f64();
+        delta = total_ticks.saturating_sub(sample.ticks);
+    }).or_insert_with(|| CpuSample {
+        ticks: total_ticks,
+        time: now,
+        launched_from: read_launch_app(parent),
+    });
+    // A process listening on multiple sockets gets one CPU reading per scan.
+    let cpu = *cpu_scan.readings.entry(key).or_insert_with(|| {
+        sample.ticks = total_ticks;
+        sample.time = now;
+        cpu_usage_percent(delta, elapsed, clk_tck, num_cpus())
+    });
+    (cpu, seconds as u64, sample.launched_from.clone())
+}
+
+fn merge_entries_by_port(entries: Vec<PortEntry>) -> Vec<PortEntry> {
+    use std::collections::btree_map::Entry;
+    let mut by_port: BTreeMap<u16, PortEntry> = BTreeMap::new();
+    for mut entry in entries {
+        match by_port.entry(entry.port) {
+            Entry::Vacant(slot) => { slot.insert(entry); }
+            Entry::Occupied(mut slot) => {
+                let merged = slot.get_mut();
+                if entry.pid != 0 && (merged.pid == 0 || entry.pid < merged.pid) {
+                    std::mem::swap(merged, &mut entry);
+                }
+                merged.pids.append(&mut entry.pids);
+                merged.is_protected |= entry.is_protected;
+            }
+        }
+    }
+    by_port.into_values().map(|mut row| {
+        row.pids.sort_unstable();
+        row.pids.dedup();
+        row
+    }).collect()
+}
+
+// ─── Listening sockets and their process owners ────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ListeningSocket {
+    port: u16,
+    inode: u64,
+    uid: u32,
+}
+
+fn parse_proc_tcp_line(line: &str) -> Option<ListeningSocket> {
+    let mut fields = line.split_whitespace();
+    let port = u16::from_str_radix(fields.nth(1)?.rsplit_once(':')?.1, 16).ok()?;
+    if fields.nth(1)? != "0A" {
         return None;
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
-
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        // Fields: State RecvQ SendQ LocalAddr:Port PeerAddr:Port [Process...]
-        // Process names can contain spaces (e.g. next-server (v16.2.7)), so the
-        // users:(...) blob may span multiple whitespace-separated fields.
-        if fields.len() < 5 {
-            continue;
-        }
-
-        let local = fields[3]; // e.g. "0.0.0.0:3000" or "[::]:8080" or "*:18789"
-        let port_str = local.rsplit(':').next().unwrap_or("");
-        let Ok(port) = port_str.parse::<u16>() else {
-            continue;
-        };
-
-        // Prefer the full users:(...) span from the raw line — not fields[5] alone.
-        let process_info = line
-            .find("users:(")
-            .map(|idx| &line[idx..])
-            .unwrap_or("");
-        let (pid, ss_name) = parse_ss_process(process_info);
-        let mut pids = parse_ss_pids(process_info);
-        if pids.is_empty() && pid > 0 {
-            pids.push(pid);
-        }
-
-        // Only show ports that have an associated process we can identify, 
-        // to filter out system-level ports (like 53 for DNS) that we can't manage.
-        if !show_all && pid == 0 && ss_name.is_empty() {
-            continue;
-        }
-
-        let cmdline = if pid > 0 { get_cmdline(pid) } else { String::new() };
-        let cwd = if pid > 0 { get_process_cwd(pid) } else { String::new() };
-        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 { get_process_stats(pid) } else { (0.0, 0.0, 0) };
-        let process_name = resolve_display_name(pid, &ss_name, &cmdline);
-
-        entries.push(make_port_entry(
-            port,
-            pid,
-            pids,
-            process_name,
-            cmdline,
-            cwd,
-            cpu_percent,
-            mem_mb,
-            uptime_seconds,
-        ));
-    }
-
-    entries.sort_by_key(|e| e.port);
-    Some(entries)
+    let uid = fields.nth(3)?.parse().ok()?;
+    let inode = fields.nth(1)?.parse().ok()?;
+    (inode != 0).then_some(ListeningSocket { port, inode, uid })
 }
 
-/// Parse `users:(("node",pid=1234,fd=5))` → (1234, "node")
-fn parse_ss_process(users: &str) -> (u32, String) {
-    // Find pid=NNN
-    let pid = users
-        .split("pid=")
-        .nth(1)
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.split(')').next())
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-
-    // Find process name between first `("` and `"`
-    let name = users
-        .split("((\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .unwrap_or("")
-        .to_string();
-
-    (pid, name)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketOwner {
+    pid: u32,
+    fd: u32,
 }
 
-fn parse_ss_pids(users: &str) -> Vec<u32> {
-    users
-        .split("pid=")
-        .skip(1)
-        .filter_map(|chunk| {
-            let digits: String = chunk.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            digits.parse::<u32>().ok()
-        })
-        .collect()
+type InodeOwners = HashMap<u64, Vec<SocketOwner>>;
+
+fn prune_inode_owners(
+    cache: &mut InodeOwners,
+    listening_inodes: &HashSet<u64>,
+    still_owns: impl Fn(u64, SocketOwner) -> bool,
+) -> bool {
+    cache.retain(|inode, owners| {
+        listening_inodes.contains(inode) && owners.iter().all(|&owner| still_owns(*inode, owner))
+    });
+    listening_inodes.iter().any(|inode| !cache.contains_key(inode))
 }
 
-// ─── Fallback: /proc/net/tcp parsing ─────────────────────────────────────────
+fn socket_inode(target: &std::path::Path) -> Option<u64> {
+    target.to_str()?.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+}
 
-fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
-    use std::collections::HashMap;
-    use std::path::Path;
-
-    // Build inode → pid map
-    let mut inode_to_pid: HashMap<u64, u32> = HashMap::new();
+fn discover_inode_owners(listening_inodes: &HashSet<u64>) -> InodeOwners {
+    let mut cache: InodeOwners = listening_inodes.iter().map(|&inode| (inode, Vec::new())).collect();
     if let Ok(procs) = fs::read_dir("/proc") {
-        for entry in procs.flatten() {
-            let name = entry.file_name();
-            let Some(pid_str) = name.to_str() else { continue };
-            let Ok(pid) = pid_str.parse::<u32>() else { continue };
-            let fd_dir = Path::new("/proc").join(pid_str).join("fd");
-            let Ok(fds) = fs::read_dir(&fd_dir) else { continue };
+        for process in procs.flatten() {
+            let Some(pid) = process.file_name().to_str().and_then(|name| name.parse().ok()) else {
+                continue;
+            };
+            let Ok(fds) = fs::read_dir(process.path().join("fd")) else {
+                continue;
+            };
             for fd in fds.flatten() {
-                if let Ok(target) = fs::read_link(fd.path()) {
-                    let s = target.to_string_lossy();
-                    if s.starts_with("socket:[") && s.ends_with(']') {
-                        if let Ok(inode) = s[8..s.len() - 1].parse::<u64>() {
-                            inode_to_pid.insert(inode, pid);
-                        }
+                let Ok(target) = fs::read_link(fd.path()) else { continue };
+                let Some(owners) = socket_inode(&target).and_then(|inode| cache.get_mut(&inode)) else {
+                    continue;
+                };
+                if let Some(fd) = fd.file_name().to_str().and_then(|name| name.parse().ok()) {
+                    if !owners.iter().any(|owner| owner.pid == pid) {
+                        owners.push(SocketOwner { pid, fd });
                     }
                 }
             }
         }
     }
-
-    let mut all = parse_proc_tcp("/proc/net/tcp", &inode_to_pid, show_all);
-    all.extend(parse_proc_tcp("/proc/net/tcp6", &inode_to_pid, show_all));
-
-    let mut seen = std::collections::HashSet::new();
-    all.retain(|e| seen.insert(e.port));
-    all.sort_by_key(|e| e.port);
-    all
+    cache
 }
 
-fn parse_proc_tcp(path: &str, inode_to_pid: &std::collections::HashMap<u64, u32>, show_all: bool) -> Vec<PortEntry> {
-    let Ok(content) = fs::read_to_string(path) else { return vec![] };
-    let mut results = Vec::new();
-
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 10 || fields[3] != "0A" { continue; }
-
-        let inode: u64 = fields[9].parse().unwrap_or(0);
-        if inode == 0 { continue; }
-
-        // Decode port from local_address hex (last 4 hex chars after ':')
-        let local = fields[1];
-        let port_hex = local.rsplit(':').next().unwrap_or("");
-        let Ok(port) = u16::from_str_radix(port_hex, 16) else { continue };
-
-        let pid = inode_to_pid.get(&inode).copied().unwrap_or(0);
-        let pids = if pid > 0 { vec![pid] } else { vec![] };
-        let cmdline = if pid > 0 { get_cmdline(pid) } else { String::new() };
-        let process_name = resolve_display_name(pid, "", &cmdline);
-
-        if !show_all && pid == 0 {
-            continue;
+fn scan_with_proc(show_all: bool) -> Vec<PortEntry> {
+    static INODE_OWNERS: OnceLock<Mutex<InodeOwners>> = OnceLock::new();
+    let mut cache = INODE_OWNERS.get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let mut sockets = Vec::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        if let Ok(content) = fs::read_to_string(path) {
+            sockets.extend(content.lines().skip(1).filter_map(parse_proc_tcp_line));
         }
-        let cwd = if pid > 0 { get_process_cwd(pid) } else { String::new() };
-        let (cpu_percent, mem_mb, uptime_seconds) = if pid > 0 { get_process_stats(pid) } else { (0.0, 0.0, 0) };
-
-        results.push(make_port_entry(
-            port,
-            pid,
-            pids,
-            process_name,
-            cmdline,
-            cwd,
-            cpu_percent,
-            mem_mb,
-            uptime_seconds,
-        ));
     }
-    results
+    let listening_inodes = sockets.iter().map(|socket| socket.inode).collect();
+
+    // Checking the cached FD also catches closed listeners and PID reuse before a kill.
+    if prune_inode_owners(&mut cache, &listening_inodes, |inode, owner| {
+        fs::read_link(format!("/proc/{}/fd/{}", owner.pid, owner.fd))
+            .ok().and_then(|target| socket_inode(&target)) == Some(inode)
+    }) {
+        // Cache unreadable sockets too, or system listeners would trigger a full walk every poll.
+        *cache = discover_inode_owners(&listening_inodes);
+    }
+
+    let mut cpu_scan = CpuScan::new();
+    let mut entries = Vec::new();
+    for socket in sockets {
+        let owners = &cache[&socket.inode];
+        if owners.is_empty() && show_all {
+            entries.push(make_port_entry(socket, 0, &mut cpu_scan));
+        }
+        for owner in owners {
+            entries.push(make_port_entry(socket, owner.pid, &mut cpu_scan));
+        }
+    }
+    cpu_scan.finish();
+    merge_entries_by_port(entries)
 }
 
 // ─── Tauri Commands ───────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
-    #[cfg(debug_assertions)]
-    let log_path = "/tmp/harbor.log".to_string();
-    #[cfg(debug_assertions)]
-    let write_log = |message: &str| {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "{message}");
-        }
-    };
+async fn scan_ports(show_all: bool) -> Result<Vec<PortEntry>, String> {
+    append_log(&format!(">>> scan_ports called with show_all={show_all}"));
 
-    #[cfg(debug_assertions)]
-    write_log(&format!(">>> scan_ports called with show_all={show_all}"));
-
-    let (tx, rx) = mpsc::channel();
-    #[cfg(debug_assertions)]
-    let log_path_for_thread = log_path.clone();
-    std::thread::spawn(move || {
-        #[cfg(debug_assertions)]
-        let write_log = |message: &str| {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path_for_thread)
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{message}");
-            }
-        };
-
-        let res = if let Some(entries) = scan_with_ss(show_all) {
-            #[cfg(debug_assertions)]
-            write_log(&format!(
-                ">>> scan_with_ss succeeded with {} entries",
-                entries.len()
-            ));
-            entries
-        } else {
-            #[cfg(debug_assertions)]
-            write_log(">>> scan_with_ss failed, falling back to scan_with_proc");
-            let entries = scan_with_proc(show_all);
-            #[cfg(debug_assertions)]
-            write_log(&format!(
-                ">>> scan_with_proc succeeded with {} entries",
-                entries.len()
-            ));
-            entries
-        };
-
-        #[cfg(debug_assertions)]
-        write_log(">>> scan_ports returning to JS");
-        let _ = tx.send(res);
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        let entries = scan_with_proc(show_all);
+        append_log(&format!(">>> scan_with_proc returned {} entries", entries.len()));
+        append_log(">>> scan_ports returning to JS");
+        *last_scan() = Some((show_all, entries.clone()));
+        entries
     });
 
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(entries) => Ok(entries),
+    match tokio::time::timeout(Duration::from_secs(10), scan).await {
+        Ok(result) => result.map_err(|err| err.to_string()),
         Err(_) => {
-            #[cfg(debug_assertions)]
-            write_log(">>> scan_ports timed out");
+            append_log(">>> scan_ports timed out");
             Err("scan timed out after 10 seconds".to_string())
         }
     }
 }
 
+/// The last scan outlives the WebView, so a recreated popup can draw it at once
+/// while its own first scan runs.
+fn last_scan() -> MutexGuard<'static, Option<(bool, Vec<PortEntry>)>> {
+    static LAST_SCAN: Mutex<Option<(bool, Vec<PortEntry>)>> = Mutex::new(None);
+    LAST_SCAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[tauri::command]
-fn kill_processes(pids: Vec<u32>, force: bool) -> Result<(), String> {
+fn cached_ports(show_all: bool) -> Option<Vec<PortEntry>> {
+    last_scan()
+        .as_ref()
+        .filter(|(scanned_all, _)| *scanned_all == show_all)
+        .map(|(_, entries)| entries.clone())
+}
+
+fn matching_pids(mut requested: Vec<u32>, listening: &[u32]) -> Vec<u32> {
+    requested.retain(|pid| *pid > 0 && listening.contains(pid));
+    requested
+}
+
+#[tauri::command]
+async fn kill_processes(port: u16, pids: Vec<u32>, force: bool) -> Result<(), String> {
     let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
     append_log(&format!(
-        ">>> kill_processes called with signal={} pids={:?}",
-        signal, pids
+        ">>> kill_processes called with port={port} signal={signal} pids={pids:?}"
     ));
 
-    let killable: Vec<u32> = pids.into_iter().filter(|pid| *pid > 0).collect();
+    let entries = scan_ports(true).await?;
+    let listening = entries
+        .iter()
+        .find(|entry| entry.port == port)
+        .map_or(&[][..], |entry| entry.pids.as_slice());
+    let killable = matching_pids(pids, listening);
     if killable.is_empty() {
-        return Err("No valid process IDs to kill".to_string());
+        return Err(format!(
+            "Process on :{port} changed or exited; refresh and try again"
+        ));
     }
 
+    tauri::async_runtime::spawn_blocking(move || signal_processes(killable, signal))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn signal_processes(killable: Vec<u32>, signal: i32) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for pid in killable {
@@ -813,19 +806,31 @@ fn kill_processes(pids: Vec<u32>, force: bool) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn kill_process(pid: u32) -> Result<(), String> {
-    kill_processes(vec![pid], false)
-}
-
-#[tauri::command]
-fn force_kill_process(pid: u32) -> Result<(), String> {
-    kill_processes(vec![pid], true)
-}
+const WEBKIT_SOFTWARE_RENDERING: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
 
 #[tauri::command]
 fn open_in_browser(url: String) -> Result<(), String> {
-    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+    use gtk::{gdk, gio, gio::prelude::AppLaunchContextExt};
+
+    if !is_local_browser_url(&url) {
+        return Err("Expected an HTTP loopback URL with a port".into());
+    }
+
+    let context = gdk::Display::default().and_then(|display| display.app_launch_context());
+    if let Some(context) = &context {
+        context.set_timestamp(gtk::current_event_time());
+        context.unsetenv(WEBKIT_SOFTWARE_RENDERING);
+    }
+    gio::AppInfo::launch_default_for_uri(&url, context.as_ref()).map_err(|err| err.to_string())
+}
+
+fn is_local_browser_url(url: &str) -> bool {
+    url.strip_prefix("http://localhost:")
+        .or_else(|| url.strip_prefix("http://127.0.0.1:"))
+        .is_some_and(|port| {
+            port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|port| port != 0)
+        })
 }
 
 #[tauri::command]
@@ -833,128 +838,211 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-// ─── App Entry ────────────────────────────────────────────────────────────────
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let quit = MenuItemBuilder::new("Quit harbor").id("quit").build(app)?;
-            let show = MenuItemBuilder::new("Show").id("show").build(app)?;
-            let menu = MenuBuilder::new(app)
-                .item(&show)
-                .separator()
-                .item(&quit)
-                .build()?;
-
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "quit" => app.exit(0),
-                    "show" => toggle_window(app),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        position,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        show_or_hide_near_tray(app, position.x, position.y);
-                    }
-                })
-                .build(app)?;
-
-            // Start hidden — only show on tray click
-            if let Some(win) = app.get_webview_window("main") {
-                win.hide().ok();
-            }
-
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            scan_ports,
-            kill_processes,
-            kill_process,
-            force_kill_process,
-            open_in_browser,
-            quit_app
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running harbor");
+struct HarborTray {
+    app: AppHandle,
+    icon: ksni::Icon,
 }
 
-// ─── Window helpers ───────────────────────────────────────────────────────────
+impl ksni::Tray for HarborTray {
+    const MENU_ON_ACTIVATE: bool = false;
 
-fn toggle_window(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        if win.is_visible().unwrap_or(false) {
-            win.hide().ok();
-        } else {
-            win.show().ok();
-            win.set_focus().ok();
+    fn id(&self) -> String {
+        "harbor".into()
+    }
+
+    fn title(&self) -> String {
+        "harbor".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![self.icon.clone()]
+    }
+
+    fn activate(&mut self, x: i32, y: i32) {
+        append_log(&format!(">>> tray activate x={x} y={y}"));
+        popup::request(&self.app, Some((x, y)), ksni::current_xdg_activation_token());
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+
+        vec![StandardItem {
+            label: "Open harbor".into(),
+            activate: Box::new(|tray: &mut Self| {
+                popup::request(&tray.app, None, ksni::current_xdg_activation_token());
+            }),
+            ..Default::default()
+        }
+        .into()]
+    }
+}
+
+/// The tray icon, or None while the GNOME extension provides the panel button.
+#[derive(Default)]
+struct TrayState(std::sync::Mutex<Option<ksni::Handle<HarborTray>>>);
+
+/// Start the tray icon if it isn't running. Failures are logged; the popup stays
+/// reachable through single-instance launches.
+async fn start_tray(app: AppHandle) {
+    let state = app.state::<TrayState>();
+    if state.0.lock().unwrap_or_else(|err| err.into_inner()).is_some() {
+        return;
+    }
+    match spawn_tray(app.clone()).await {
+        Ok(handle) => {
+            *state.0.lock().unwrap_or_else(|err| err.into_inner()) = Some(handle);
+            append_log(">>> tray service started via ksni");
+        }
+        Err(err) => {
+            let message = format!(">>> tray startup failed: {err}");
+            append_log(&message);
+            eprintln!("{message}");
         }
     }
 }
 
-fn show_or_hide_near_tray(app: &AppHandle, tray_x: f64, tray_y: f64) {
-    let Some(win) = app.get_webview_window("main") else { return };
+async fn stop_tray(app: &AppHandle) {
+    let handle = app.state::<TrayState>().0.lock().unwrap_or_else(|err| err.into_inner()).take();
+    if let Some(handle) = handle {
+        handle.shutdown().await;
+        append_log(">>> tray service stopped (GNOME extension active)");
+    }
+}
 
-    if win.is_visible().unwrap_or(false) {
-        win.hide().ok();
+async fn spawn_tray(app: AppHandle) -> Result<ksni::Handle<HarborTray>, String> {
+    let image = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+        .map_err(|err| err.to_string())?;
+    let icon = ksni::Icon {
+        width: image.width() as i32,
+        height: image.height() as i32,
+        data: image
+            .rgba()
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]])
+            .collect(),
+    };
+    HarborTray { app, icon }
+        .assume_sni_available(true)
+        .spawn()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+// ─── App Entry ────────────────────────────────────────────────────────────────
+
+const ACTIVATION_TOKEN_ARG: &str = "--activation-token=";
+
+// shortcut: mirrors the plugin's private D-Bus API; re-check when bumping the pinned version.
+fn forward_activation_token(identifier: &str, token: &str) -> bool {
+    use gtk::{gio, glib::variant::ToVariant};
+
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return false;
+    };
+    let name = format!("{identifier}.SingleInstance");
+    let path = format!("/{}", name.replace('.', "/").replace('-', "_"));
+    let args: Vec<_> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .chain(std::iter::once(format!("{ACTIVATION_TOKEN_ARG}{token}")))
+        .collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+
+    // The Linux single-instance plugin forwards argv but does not forward the launch environment.
+    bus.call_sync(
+        Some(&name),
+        &path,
+        "org.SingleInstance.DBus",
+        "ExecuteCallback",
+        Some(&(args, cwd.to_string_lossy().as_ref()).to_variant()),
+        None,
+        gio::DBusCallFlags::NO_AUTO_START,
+        1000,
+        gio::Cancellable::NONE,
+    )
+    .is_ok()
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // Start WebKit in software mode: switching after view creation can break wheel scrolling.
+    // A value the user set (e.g. 0 to force GPU rendering) is kept.
+    if std::env::var_os(WEBKIT_SOFTWARE_RENDERING).is_none() {
+        std::env::set_var(WEBKIT_SOFTWARE_RENDERING, "1");
+    }
+    let context = tauri::generate_context!();
+    // Wayland activation token, or the X11 startup-notification id: the window
+    // that consumes it gets focus and ends the launcher's busy cursor.
+    let startup_token = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|token| !token.is_empty()));
+    if startup_token
+        .as_deref()
+        .is_some_and(|token| forward_activation_token(&context.config().identifier, token))
+    {
         return;
     }
 
-    let win_w = 400.0f64;
-    let win_h = 520.0f64;
-    let margin = 12.0f64;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("error while starting harbor's async runtime");
+    tauri::async_runtime::set(runtime.handle().clone());
 
-    // Get screen dimensions to anchor to the correct edge
-    let (x, y) = win
-        .primary_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| {
-            let screen_w = monitor.size().width as f64;
-            let screen_h = monitor.size().height as f64;
-            let mon_x = monitor.position().x as f64;
-            let mon_y = monitor.position().y as f64;
+    let placement_mode = popup::choose_placement_mode();
+    let mut app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if !args.iter().skip(1).any(|arg| arg == "--hidden") {
+                let token = args
+                    .iter()
+                    .skip(1)
+                    .rev()
+                    .filter_map(|arg| arg.strip_prefix(ACTIVATION_TOKEN_ARG))
+                    .find(|token| !token.is_empty())
+                    .map(str::to_owned);
+                popup::request(app, None, token);
+            }
+        }))
+        .on_window_event(popup::on_window_event)
+        .setup(move |app| {
+            popup::setup(app.handle(), placement_mode);
 
-            // Horizontal: clamp so window stays on screen, biased to right edge
-            let raw_x = tray_x - win_w / 2.0;
-            let x = raw_x
-                .max(mon_x + margin)
-                .min(mon_x + screen_w - win_w - margin);
+            app.manage(TrayState::default());
+            // Serves the extension's D-Bus API and starts the tray icon unless the
+            // GNOME extension is active.
+            tauri::async_runtime::spawn(gnome::run(app.handle().clone()));
 
-            // Vertical: if tray is in bottom half → show above; top half → show below
-            let y = if tray_y > mon_y + screen_h / 2.0 {
-                // bottom tray (e.g. GNOME bottom panel)
-                tray_y - win_h - margin
-            } else {
-                // top tray (e.g. GNOME top bar)
-                tray_y + margin
-            };
-            let y = y.max(mon_y + margin).min(mon_y + screen_h - win_h - margin);
-
-            (x, y)
+            if !std::env::args_os().skip(1).any(|arg| arg == "--hidden") {
+                popup::request(app.handle(), None, startup_token);
+            }
+            Ok(())
         })
-        .unwrap_or_else(|| {
-            // Fallback if monitor info unavailable
-            let x = (tray_x - win_w / 2.0).max(0.0);
-            let y = (tray_y - win_h - margin).max(0.0);
-            (x, y)
-        });
-
-    win.set_position(tauri::PhysicalPosition::new(x as i32, y as i32))
-        .ok();
-    win.show().ok();
-    win.set_focus().ok();
+        .invoke_handler(tauri::generate_handler![
+            scan_ports,
+            cached_ports,
+            kill_processes,
+            open_in_browser,
+            quit_app,
+            popup::resize_popup,
+            popup::popup_ready,
+            gnome::gnome_integration_status,
+            gnome::enable_gnome_integration,
+            autostart::autostart_enabled,
+            autostart::set_autostart
+        ])
+        .build(context)
+        .expect("error while building harbor");
+    app.wry_plugin(popup::ReleaseWebContext::default());
+    app.run(|app, event| match event {
+        tauri::RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if label == "main" => popup::on_destroyed(app),
+        _ => (),
+    });
+    runtime.shutdown_background();
 }
 
 #[cfg(test)]
@@ -963,6 +1051,178 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn system_markers_match_program_names_not_paths() {
+        assert!(is_known_system_process("gsd-xsettings", "/usr/libexec/gsd-xsettings", "/usr/libexec/gsd-xsettings"));
+        assert!(is_known_system_process("tracker-miner-f", "", "/usr/libexec/tracker-miner-fs-3"));
+        assert!(!is_known_system_process(
+            "node",
+            "node /home/u/code/issue-tracker-api/dist/main.js",
+            "/usr/bin/node"
+        ));
+        assert!(!is_known_system_process("node", "node /home/u/evolution-api/server.js", "/usr/bin/node"));
+    }
+
+    #[test]
+    fn browser_urls_require_http_loopback_and_a_valid_port() {
+        for url in ["http://localhost:3000", "http://127.0.0.1:65535"] {
+            assert!(is_local_browser_url(url), "{url}");
+        }
+        for url in [
+            "http://localhost",
+            "http://localhost:0",
+            "http://localhost:65536",
+            "http://localhost:+3000",
+            "http://localhost:3000/path",
+            "http://localhost:3000@evil.example",
+            "http://localhost.evil.example:3000",
+            "https://127.0.0.1:3000",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_local_browser_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn parses_only_listening_tcp_sockets_from_both_address_families() {
+        let ipv4 = "0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 321";
+        let ipv6 = "1: 00000000000000000000000001000000:2329 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 1001 0 654";
+        assert_eq!(
+            parse_proc_tcp_line(ipv4),
+            Some(ListeningSocket { port: 8080, inode: 321, uid: 1000 })
+        );
+        assert_eq!(
+            parse_proc_tcp_line(ipv6),
+            Some(ListeningSocket { port: 9001, inode: 654, uid: 1001 })
+        );
+        assert_eq!(parse_proc_tcp_line(&ipv4.replace(" 0A ", " 01 ")), None);
+        assert_eq!(parse_proc_tcp_line("0: 0100007F:1F90 00000000:0000 0A"), None);
+    }
+
+    #[test]
+    fn prunes_closed_and_stale_inodes_and_keeps_cache_hits() {
+        let owner = SocketOwner { pid: 42, fd: 3 };
+        let stale = SocketOwner { pid: 43, fd: 4 };
+        let mut cache = HashMap::from([
+            (1, vec![owner]),
+            (2, vec![stale]),
+            (3, vec![owner]),
+            (4, vec![]),
+        ]);
+        let listening = HashSet::from([1, 4]);
+        assert!(!prune_inode_owners(&mut cache, &listening, |_, _| true));
+        assert_eq!(cache, HashMap::from([(1, vec![owner]), (4, vec![])]));
+
+        let with_new_listener = HashSet::from([1, 4, 5]);
+        assert!(prune_inode_owners(&mut cache, &with_new_listener, |_, _| true));
+        assert!(prune_inode_owners(&mut cache, &listening, |_, _| false));
+        assert_eq!(cache, HashMap::from([(4, vec![])]));
+    }
+
+    #[test]
+    fn resolves_scoped_unscoped_and_bin_package_names() {
+        for (path, name) in [
+            ("/project/node_modules/@openai/codex/vendor/bin/codex", "codex"),
+            ("/project/node_modules/openclaw/dist/index.js", "openclaw"),
+            ("/project/node_modules/.bin/tauri", "tauri"),
+        ] {
+            assert_eq!(package_name_from_script_path(path).as_deref(), Some(name));
+        }
+        assert_eq!(package_name_from_script_path("/project/node_modules/@openai"), None);
+    }
+
+    #[test]
+    fn parses_proc_stat_after_the_process_name() {
+        let fields = "S 4 5 6 7 8 9 10 11 12 13 140 150 16 17 18 19 20 21 220 23";
+        for name in ["node", "next-server (v16.2.7)", "worker) pool"] {
+            let stat = format!("123 ({name}) {fields}");
+            assert_eq!(parse_proc_stat(&stat), Some((4, 140, 150, 220)));
+        }
+    }
+
+    #[test]
+    fn resolves_launchers_before_falling_back_to_the_nearest_non_shell() {
+        let resolve = |names: &[&str]| resolve_launch_app(names.iter().map(|name| (*name).to_owned()));
+        assert_eq!(resolve(&["bash", "wrapper", "tmux: server", "kitty"]), "tmux");
+        assert_eq!(resolve(&["bash", "gnome-terminal-", "systemd"]), "GNOME Terminal");
+        assert_eq!(resolve(&["zsh", "wrapper", "other", "init"]), "wrapper");
+        assert_eq!(resolve(&["sh", "systemd", "code"]), "service");
+        assert_eq!(resolve(&["fish", "RustRover"]), "RustRover");
+    }
+
+    #[test]
+    fn rejects_incomplete_proc_stat() {
+        assert_eq!(parse_proc_stat("123 missing-comm S 4 5"), None);
+        assert_eq!(parse_proc_stat("123 (node) S 4 5"), None);
+    }
+
+    #[test]
+    fn calculates_cpu_usage_from_elapsed_time_and_ticks() {
+        assert_eq!(cpu_usage_percent(50, 2.0, 100.0, 4.0), 25.0);
+        assert_eq!(cpu_usage_percent(50, 0.0, 100.0, 4.0), 0.0);
+        assert_eq!(cpu_usage_percent(50, -1.0, 100.0, 4.0), 0.0);
+        assert_eq!(cpu_usage_percent(0, 1.0, 100.0, 4.0), 0.0);
+        assert_eq!(cpu_usage_percent(1000, 1.0, 100.0, 4.0), 400.0);
+    }
+
+    #[test]
+    fn protects_zero_pid_system_processes_and_other_users() {
+        assert!(compute_is_protected(0, 1000, 1000, false));
+        assert!(compute_is_protected(42, 1000, 1000, true));
+        assert!(compute_is_protected(42, 1001, 1000, false));
+        assert!(!compute_is_protected(42, 1000, 1000, false));
+    }
+
+    #[test]
+    fn keeps_only_requested_pids_still_listening_on_the_port() {
+        let listening = [42, 43];
+        assert_eq!(matching_pids(vec![43, 42], &listening), vec![43, 42]);
+        assert_eq!(matching_pids(vec![0, 99, 42], &listening), vec![42]);
+        assert!(matching_pids(vec![99], &listening).is_empty());
+        assert!(matching_pids(vec![42], &[]).is_empty());
+    }
+
+    #[test]
+    fn merges_ports_using_lowest_known_pid_and_sorted_unique_pids() {
+        let first = PortEntry {
+            port: 8080,
+            pid: 42,
+            pids: vec![42, 42, 43],
+            process_name: "first".to_string(),
+            launched_from: "Ptyxis".into(),
+            cmdline: String::new(),
+            cwd: String::new(),
+            state: "listening".to_string(),
+            cpu_percent: 0.0,
+            mem_mb: 0.0,
+            uptime_seconds: 0,
+            uid: 1000,
+            is_protected: false,
+        };
+        let second = PortEntry {
+            pid: 44,
+            pids: vec![44, 43, 44],
+            process_name: "second".to_string(),
+            is_protected: true,
+            ..first.clone()
+        };
+        let other_port = PortEntry {
+            port: 3000,
+            ..first.clone()
+        };
+
+        let unknown = PortEntry { pid: 0, pids: vec![], ..first.clone() };
+        let merged = merge_entries_by_port(vec![unknown, second, other_port, first]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].port, 3000);
+        assert_eq!(merged[0].pids, vec![42, 43]);
+        assert_eq!(merged[1].port, 8080);
+        assert_eq!(merged[1].pid, 42);
+        assert_eq!(merged[1].process_name, "first");
+        assert!(merged[1].is_protected);
+        assert_eq!(merged[1].pids, vec![42, 43, 44]);
+    }
 
     fn pid_alive(pid: u32) -> bool {
         if pid == 0 {
@@ -1000,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_processes_terminates_a_simple_process() {
+    fn signal_processes_terminates_a_simple_process() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 30")
@@ -1012,14 +1272,14 @@ mod tests {
         let pid = child.id();
         assert!(pid_alive(pid));
 
-        kill_processes(vec![pid], true).expect("kill process");
+        signal_processes(vec![pid], libc::SIGKILL).expect("kill process");
         wait_until_dead(pid, Duration::from_secs(3));
 
         let _ = child.wait();
     }
 
     #[test]
-    fn kill_processes_terminates_a_process_tree() {
+    fn signal_processes_terminates_a_process_tree() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 30 & wait")
@@ -1050,7 +1310,7 @@ mod tests {
         assert!(pid_alive(pid));
         assert!(pid_alive(spawned_child));
 
-        kill_processes(vec![pid], true).expect("kill process tree");
+        signal_processes(vec![pid], libc::SIGKILL).expect("kill process tree");
         wait_until_dead(pid, Duration::from_secs(3));
         wait_until_dead(spawned_child, Duration::from_secs(3));
 
@@ -1058,11 +1318,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live localhost ports (next on :3000, ulauncher on :5054)"]
+    #[ignore = "requires live localhost ports (same-user next on :3000, ulauncher on :5054)"]
     fn scan_marks_next_killable_and_ulauncher_protected() {
-        let Some(entries) = scan_with_ss(true) else {
-            return;
-        };
+        let entries = scan_with_proc(true);
 
         if let Some(next) = entries.iter().find(|e| e.port == 3000) {
             eprintln!(
